@@ -7,7 +7,7 @@
 
 -export([lock/2]).
 -export([request_lock/3, commit_lock/4, abort_lock/2]).
--export([get_up_nodes/0, pid/1, get_debug_state/0]).
+-export([get_nodes/0, pid/1, get_debug_state/0]).
 
 
 %% gen_server callbacks
@@ -17,17 +17,11 @@
 -record(state, {
           n,
           w,
-
           nodes = [],
-          up_nodes = [],
-          down_nodes = [],
-          joining_nodes = [],
-
           pending = [], %% {tag, key, pid, now}
           db = dict:new(),
+          commands = [],
           leases = gb_trees:empty(),
-
-          heartbeat_ref,
           lease_ref
 }).
 
@@ -38,12 +32,12 @@
 start_link(N, W) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [N, W], []).
 
-get_up_nodes() ->
-    gen_server:call(?MODULE, get_up_nodes).
+get_nodes() ->
+    gen_server:call(?MODULE, get_nodes).
 
 lock(Key, Pid) ->
     error_logger:info_msg("acquiring lock~n"),
-    case get_up_nodes() of
+    case get_nodes() of
         {ok, Nodes, W} ->
             error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
@@ -97,7 +91,7 @@ pid(Key) ->
     gen_server:call(?MODULE, {get_pid, Key}).
 
 add_node(Node) ->
-    gen_server:call(?MODULE, {add_node, Node}).
+    gen_server:cast(?MODULE, {add_node, Node}).
 
 extend_lease(Key, Pid) ->
     gen_server:call(?MODULE, {extend_lease, Key, Pid}).
@@ -110,12 +104,10 @@ get_debug_state() ->
 %%%===================================================================
 
 init([N, W]) ->
-    ok = net_kernel:monitor_nodes(true),
+    LeaseRef = timer:send_interval(1000, expire_leases),
+    {ok, #state{n = N, w = W, lease_ref = LeaseRef}}.
 
-    HeartbeatRef = timer:send_interval(1000, send_heartbeat),
-    {ok, #state{n = N, w = W, heartbeat_ref = HeartbeatRef}}.
-
-handle_call(get_up_nodes, _From, #state{up_nodes = Nodes} = State) ->
+handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
     {reply, {ok, [node() | Nodes], State#state.w}, State};
 
 handle_call({election_winner, Key, Pid} = Msg, _From, #state{db = Db} = State) ->
@@ -198,82 +190,8 @@ handle_call({get_pid, Key}, _From, State) ->
 
 
 handle_call(get_debug_state, _From, #state{pending = Pending, db = Db} = State) ->
-    {reply, {ok, Pending, dict:to_list(Db)}, State};
+    {reply, {ok, Pending, dict:to_list(Db)}, State}.
 
-
-handle_call({add_node, Node}, _From, #state{nodes = Nodes, up_nodes = UpNodes} = State) ->
-    error_logger:info_msg("adding node ~p~n", [Node]),
-    case lists:keymember(Node, 1, Nodes) of
-        true ->
-            {reply, ok, State};
-        false ->
-            {reply, ok, State#state{nodes = [{Node, now()} | Nodes],
-                                    up_nodes = [Node | UpNodes]}}
-    end.
-
-
-handle_cast({heartbeat, Node}, #state{nodes = Nodes} = State) ->
-    NewNodes = lists:keystore(Node, 1, Nodes, {Node, now()}),
-    {noreply, State#state{nodes = NewNodes}}.
-
-
-
-
-handle_info(expire_leases, #state{db = Db, leases = Leases} = State) ->
-    Now = now_to_seconds(),
-    case gb_trees:is_empty(Leases) of
-        false ->
-            {ExpireTime, Keys, NewLeases} = gb_trees:take_smallest(Leases),
-
-            case ExpireTime < Now of
-                true ->
-                    error_logger:info_msg("leases expired: ~p~n", [Keys]),
-                    NewDb = lists:foldl(
-                              fun (Key, D) ->
-                                      dict:erase(Key, D)
-                              end, Db, Keys),
-                    {noreply, State#state{leases = NewLeases, db = NewDb}};
-                false ->
-                    {noreply, State}
-            end;
-        true ->
-            {noreply, State}
-    end;
-
-
-handle_info(send_heartbeat, State) ->
-    gen_server:abcast(nodenames(State#state.nodes), locker, {heartbeat, node()}),
-    {noreply, State};
-
-handle_info({nodedown, Node}, #state{up_nodes = UpNodes, down_nodes = DownNodes} = State) ->
-    error_logger:info_msg("nodedown: ~p~n", [Node]),
-    case lists:keymember(Node, 1, State#state.nodes) of
-        true ->
-            {noreply, State#state{up_nodes = lists:delete(Node, UpNodes),
-                                  down_nodes = lists:umerge([Node], DownNodes)}};
-        false ->
-            {noreply, State}
-    end;
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-now_to_seconds() ->
-    {MegaSeconds, Seconds, _} = now(),
-    MegaSeconds * 1000000 + Seconds.
-
-nodenames(Nodes) ->
-    [N || {N, _} <- Nodes].
 
 
 insert_lease(ExpireTime, Key, Leases) ->
@@ -299,3 +217,60 @@ lease_expire_time() ->
 is_key_pending(Key, P) ->
     lists:keymember(Key, 2, P).
 
+
+
+
+
+
+
+handle_cast({add_node, Node}, #state{nodes = Nodes} = State) ->
+    case lists:member(Node, Nodes) of
+        true ->
+            {noreply, State};
+        false ->
+            {noreply, State#state{nodes = [Node | Nodes]}}
+    end;
+
+handle_cast({election_winner, Key, Pid} = Msg,  #state{db = Db} = State) ->
+    error_logger:info_msg("got handoff winner: ~p~n", [Msg]),
+    {noreply, State#state{db = dict:store(Key, Pid, Db)}}.
+
+
+handle_info(expire_leases, #state{db = Db, leases = Leases} = State) ->
+    Now = now_to_seconds(),
+    case gb_trees:is_empty(Leases) of
+        false ->
+            {ExpireTime, Keys, NewLeases} = gb_trees:take_smallest(Leases),
+
+            case ExpireTime < Now of
+                true ->
+                    error_logger:info_msg("leases expired: ~p~n", [Keys]),
+                    NewDb = lists:foldl(
+                              fun (Key, D) ->
+                                      dict:erase(Key, D)
+                              end, Db, Keys),
+                    {noreply, State#state{leases = NewLeases, db = NewDb}};
+                false ->
+                    {noreply, State}
+            end;
+        true ->
+            {noreply, State}
+    end;
+
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+now_to_seconds() ->
+    {MegaSeconds, Seconds, _} = now(),
+    MegaSeconds * 1000000 + Seconds.
