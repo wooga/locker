@@ -11,7 +11,10 @@ all() ->
 %%     qc].
 
 quorum(_) ->
-    [A, B, C] = setup(),
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
 
     Parent = self(),
     spawn(fun() ->
@@ -34,7 +37,10 @@ quorum(_) ->
     teardown([A, B, C]).
 
 no_quorum_possible(_) ->
-    [A, B, C] = setup(),
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
 
     Parent = self(),
     spawn(fun() ->
@@ -79,27 +85,16 @@ no_quorum_possible(_) ->
 
 
 
-setup() ->
-    {ok, A} = slave:start(list_to_atom(net_adm:localhost()), a),
-    {ok, B} = slave:start(list_to_atom(net_adm:localhost()), b),
-    {ok, C} = slave:start(list_to_atom(net_adm:localhost()), c),
-    true = rpc:call(A, code, add_path, ["/home/knutin/git/locker/ebin"]),
-    true = rpc:call(B, code, add_path, ["/home/knutin/git/locker/ebin"]),
-    true = rpc:call(C, code, add_path, ["/home/knutin/git/locker/ebin"]),
+setup(NodeNames) ->
+    Nodes = [element(2, slave:start(list_to_atom(net_adm:localhost()), N)) || N <- NodeNames],
 
-    rpc:call(A, locker, start_link, [3, 2]),
-    rpc:call(B, locker, start_link, [3, 2]),
-    rpc:call(C, locker, start_link, [3, 2]),
+    [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],
+    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
 
+    %% [First | Rest] = Nodes,
+    %% [rpc:call(First, locker, add_node, [R]) || R <- Rest],
 
-    rpc:call(A, locker, add_node, [B]),
-    rpc:call(A, locker, add_node, [C]),
-    rpc:call(B, locker, add_node, [A]),
-    rpc:call(B, locker, add_node, [C]),
-    rpc:call(C, locker, add_node, [A]),
-    rpc:call(C, locker, add_node, [B]),
-
-    [A, B, C].
+    Nodes.
 
 
 teardown(Nodes) ->

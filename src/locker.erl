@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/2, add_node/1]).
+-export([start_link/1, add_node/1]).
 
 -export([lock/2]).
 -export([request_lock/3, commit_lock/4, abort_lock/2]).
@@ -15,7 +15,6 @@
          terminate/2, code_change/3]).
 
 -record(state, {
-          n,
           w,
           nodes = [],
           pending = [], %% {tag, key, pid, now}
@@ -29,8 +28,8 @@
 %%% API
 %%%===================================================================
 
-start_link(N, W) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [N, W], []).
+start_link(W) ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [W], []).
 
 get_nodes() ->
     gen_server:call(?MODULE, get_nodes).
@@ -91,7 +90,7 @@ pid(Key) ->
     gen_server:call(?MODULE, {get_pid, Key}).
 
 add_node(Node) ->
-    gen_server:cast(?MODULE, {add_node, Node}).
+    gen_server:call(?MODULE, {add_node, Node, true}).
 
 extend_lease(Key, Pid) ->
     gen_server:call(?MODULE, {extend_lease, Key, Pid}).
@@ -103,16 +102,12 @@ get_debug_state() ->
 %%% gen_server callbacks
 %%%===================================================================
 
-init([N, W]) ->
+init([W]) ->
     LeaseRef = timer:send_interval(1000, expire_leases),
-    {ok, #state{n = N, w = W, lease_ref = LeaseRef}}.
+    {ok, #state{w = W, lease_ref = LeaseRef}}.
 
 handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
     {reply, {ok, [node() | Nodes], State#state.w}, State};
-
-handle_call({election_winner, Key, Pid} = Msg, _From, #state{db = Db} = State) ->
-    error_logger:info_msg("gossiper: election winner ~p~n", [Msg]),
-    {reply, ok, State#state{db = dict:store(Key, Pid, Db)}};
 
 handle_call({request_lock, Key, Pid, Tag}, _From,
             #state{pending = Pending} = State) ->
@@ -188,52 +183,26 @@ handle_call({get_pid, Key}, _From, State) ->
             end,
     {reply, Reply, State};
 
+handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
+    case lists:member(Node, Nodes) of
+        true ->
+            {reply, ok, State};
+        false ->
+            case Reverse of
+                true ->
+                    ok = gen_server:call({locker, Node}, {add_node, node(), false});
+                false ->
+                    ok
+            end,
+            {reply, ok, State#state{nodes = [Node | Nodes]}}
+    end;
+
 
 handle_call(get_debug_state, _From, #state{pending = Pending, db = Db} = State) ->
     {reply, {ok, Pending, dict:to_list(Db)}, State}.
 
-
-
-insert_lease(ExpireTime, Key, Leases) ->
-    case gb_trees:lookup(ExpireTime, Leases) of
-        {value, V} ->
-            gb_trees:update(ExpireTime, [Key | V], Leases);
-        none ->
-            gb_trees:insert(ExpireTime, [Key], Leases)
-    end.
-
-delete_lease(ExpireTime, Key, Leases) ->
-    case gb_trees:lookup(ExpireTime, Leases) of
-        {value, Keys} ->
-            gb_trees:update(ExpireTime, lists:delete(Key, Keys), Leases);
-        none ->
-            Leases
-    end.
-
-lease_expire_time() ->
-    now_to_seconds() + 3.
-
-
-is_key_pending(Key, P) ->
-    lists:keymember(Key, 2, P).
-
-
-
-
-
-
-
-handle_cast({add_node, Node}, #state{nodes = Nodes} = State) ->
-    case lists:member(Node, Nodes) of
-        true ->
-            {noreply, State};
-        false ->
-            {noreply, State#state{nodes = [Node | Nodes]}}
-    end;
-
-handle_cast({election_winner, Key, Pid} = Msg,  #state{db = Db} = State) ->
-    error_logger:info_msg("got handoff winner: ~p~n", [Msg]),
-    {noreply, State#state{db = dict:store(Key, Pid, Db)}}.
+handle_cast(_, State) ->
+    {stop, badmsg, State}.
 
 
 handle_info(expire_leases, #state{db = Db, leases = Leases} = State) ->
@@ -274,3 +243,26 @@ code_change(_OldVsn, State, _Extra) ->
 now_to_seconds() ->
     {MegaSeconds, Seconds, _} = now(),
     MegaSeconds * 1000000 + Seconds.
+
+insert_lease(ExpireTime, Key, Leases) ->
+    case gb_trees:lookup(ExpireTime, Leases) of
+        {value, V} ->
+            gb_trees:update(ExpireTime, [Key | V], Leases);
+        none ->
+            gb_trees:insert(ExpireTime, [Key], Leases)
+    end.
+
+delete_lease(ExpireTime, Key, Leases) ->
+    case gb_trees:lookup(ExpireTime, Leases) of
+        {value, Keys} ->
+            gb_trees:update(ExpireTime, lists:delete(Key, Keys), Leases);
+        none ->
+            Leases
+    end.
+
+lease_expire_time() ->
+    now_to_seconds() + 3.
+
+
+is_key_pending(Key, P) ->
+    lists:keymember(Key, 2, P).
