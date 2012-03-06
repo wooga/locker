@@ -6,7 +6,8 @@
 all() ->
     [
      quorum,
-     no_quorum_possible
+     no_quorum_possible,
+     node_liveness
     ].
 %%     qc].
 
@@ -15,10 +16,10 @@ quorum(_) ->
 
     Parent = self(),
     spawn(fun() ->
-                  Parent ! {1, catch rpc:call(A, locker, lock, [123, Parent])}
+                  Parent ! {1, catch rpc:call(A, locker, lock, [123, self()])}
           end),
     spawn(fun() ->
-                  Parent ! {2, catch rpc:call(B, locker, lock, [123, Parent])}
+                  Parent ! {2, catch rpc:call(B, locker, lock, [123, self()])}
           end),
     receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
     receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
@@ -60,6 +61,12 @@ no_quorum_possible(_) ->
 
     teardown([A, B, C]).
 
+
+node_liveness(_) ->
+    [A, B, C] = setup(),
+    timer:sleep(5000),
+
+    teardown([A, B, C]).
 
 %% qc(_) ->
 %%     ?line true = eqc:quickcheck(delay_prop()).
