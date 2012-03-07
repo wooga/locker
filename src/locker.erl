@@ -167,7 +167,6 @@ handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
             #state{db = Db} = State) ->
     case dict:find(Key, State#state.db) of
         {ok, {Pid, StartTime, LeaseLength}} ->
-            error_logger:info_msg("now: ~p, starttime: ~p~n", [now_to_ms(), StartTime]),
             case is_expired(StartTime, LeaseLength) of
                 true ->
                     {reply, {error, already_expired}, State};
@@ -260,7 +259,4 @@ is_key_pending(Key, P) ->
 is_expired(StartTime, Lease)->
     is_expired(StartTime, Lease, now_to_ms()).
 is_expired(StartTime, Lease, NowMs)->
-    error_logger:info_msg("starttime: ~p, now: ~p, diff: ~p~n",
-                          [StartTime + Lease, NowMs,
-                           NowMs - (StartTime + Lease)]),
     StartTime + Lease < NowMs.
