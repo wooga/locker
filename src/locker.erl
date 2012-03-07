@@ -100,7 +100,8 @@ get_debug_state() ->
 %%%===================================================================
 
 init([W]) ->
-    {ok, LeaseExpireRef} = timer:send_interval(1000, expire_leases),
+    {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
+    {ok, _} = timer:send_interval(1000, expire_pending),
     {ok, #state{w = W, lease_expire_ref = LeaseExpireRef}};
 
 init([W, no_expire]) ->
@@ -132,7 +133,7 @@ handle_call({request_lock, Key, Pid, Tag}, _From,
                 true ->
                     {reply, {error, already_pending}, State};
                 false ->
-                    NewPending = [{Tag, Key, Pid, now()} | Pending],
+                    NewPending = [{Tag, Key, Pid, now_to_ms()} | Pending],
                     {reply, ok, State#state{pending = NewPending}}
             end
     end;
@@ -228,11 +229,21 @@ handle_info(expire_leases, #state{db = Db} = State) ->
                         end
                 end, [], Db),
 
+
     NewDb = lists:foldl(fun (Key, D) ->
                                 dict:erase(Key, D)
                         end, Db, Expired),
+
     {noreply, State#state{db = NewDb}};
 
+
+handle_info(expire_pending, #state{pending = Pending} = State) ->
+    Now = now_to_ms(),
+
+    NewPending = [P || {_, _, _, StartTimeMs} = P <- Pending,
+                       StartTimeMs + 5000 > Now],
+
+    {noreply, State#state{pending = NewPending}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
