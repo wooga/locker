@@ -5,8 +5,9 @@
 
 all() ->
     [
-     quorum,
-     no_quorum_possible
+     %% quorum,
+     %% no_quorum_possible
+     lease_extend
     ].
 %%     qc].
 
@@ -67,6 +68,40 @@ no_quorum_possible(_) ->
     teardown([A, B, C]).
 
 
+lease_extend(_) ->
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
+
+    Pid = self(),
+    ok = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+
+    timer:sleep(2000),
+    rpc:sbcast([A, B, C], locker, expire_leases),
+
+    {error, not_found} = rpc:call(A, locker, pid, [123]),
+    {error, not_found} = rpc:call(B, locker, pid, [123]),
+    {error, not_found} = rpc:call(C, locker, pid, [123]),
+
+    ok = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+
+
+    ok = rpc:call(B, locker, extend_lease, [123, Pid]),
+    rpc:sbcast([A, B, C], locker, expire_leases),
+    {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+
+    ok.
+
+
 %% qc(_) ->
 %%     ?line true = eqc:quickcheck(delay_prop()).
 
@@ -88,11 +123,13 @@ no_quorum_possible(_) ->
 setup(NodeNames) ->
     Nodes = [element(2, slave:start(list_to_atom(net_adm:localhost()), N)) || N <- NodeNames],
 
-    [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],
-    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
+    [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
 
-    %% [First | Rest] = Nodes,
-    %% [rpc:call(First, locker, add_node, [R]) || R <- Rest],
+    [begin
+         {ok, _, _, Ref} = rpc:call(N, locker, get_debug_state, []),
+         error_logger:info_msg("ref: ~p~n", [Ref]),
+         {ok, cancel} = rpc:call(N, timer, cancel, [Ref])
+     end || N <- Nodes],
 
     Nodes.
 

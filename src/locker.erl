@@ -5,7 +5,7 @@
 %% API
 -export([start_link/1, add_node/1]).
 
--export([lock/2]).
+-export([lock/2, extend_lease/2]).
 -export([request_lock/3, commit_lock/4, abort_lock/2]).
 -export([get_nodes/0, pid/1, get_debug_state/0]).
 
@@ -20,9 +20,10 @@
           pending = [], %% {tag, key, pid, now}
           db = dict:new(),
           commands = [],
-          leases = gb_trees:empty(),
-          lease_ref
+          lease_expire_ref
 }).
+
+-define(LEASE_LENGTH, 2000).
 
 %%%===================================================================
 %%% API
@@ -40,7 +41,7 @@ lock(Key, Pid) ->
         {ok, Nodes, W} ->
             error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
-            {Tag, RequestReplies, _BadNodes} = locker:request_lock(Nodes, Key, Pid),
+            {Tag, RequestReplies, _BadNodes} = request_lock(Nodes, Key, Pid),
             error_logger:info_msg("request replies: ~p~n", [RequestReplies]),
 
             case ok_responses(RequestReplies) of
@@ -50,22 +51,10 @@ lock(Key, Pid) ->
                     error_logger:info_msg("commit replies: ~p~n", [CommitReplies]),
                     ok;
                 _ ->
-                    {AbortReplies, _} = locker:abort_lock(Nodes, Tag),
+                    {AbortReplies, _} = abort_lock(Nodes, Tag),
                     error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
                     {error, no_quorum}
             end;
-
-            %% OtherPids = [P || {_, {error, already_registered, P}} <- Replies],
-
-            %% case resolve_conflicts(self(), OtherPids) of
-            %%     won ->
-            %%         locker:won_election(Nodes, State#state.key, self()),
-            %%         ExtendLeaseRef = schedule_lease_extend(),
-            %%         {next_state, running, State#state{extend_lease_ref = ExtendLeaseRef}};
-            %%     no_conflict ->
-            %%         {next_state, running, State};
-            %%     lost ->
-            %%         {stop, already_locked, State}
 
         {error, minority} ->
             {error, minority}
@@ -93,7 +82,15 @@ add_node(Node) ->
     gen_server:call(?MODULE, {add_node, Node, true}).
 
 extend_lease(Key, Pid) ->
-    gen_server:call(?MODULE, {extend_lease, Key, Pid}).
+    {ok, Nodes, W} = get_nodes(),
+    {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
+                                                 {extend_lease, Key, Pid, 2000}),
+    case ok_responses(Replies) of
+        N when length(N) >= W ->
+            ok;
+        _ ->
+            {error, not_all_ok}
+    end.
 
 get_debug_state() ->
     gen_server:call(?MODULE, get_debug_state).
@@ -103,11 +100,18 @@ get_debug_state() ->
 %%%===================================================================
 
 init([W]) ->
-    LeaseRef = timer:send_interval(1000, expire_leases),
-    {ok, #state{w = W, lease_ref = LeaseRef}}.
+    {ok, LeaseExpireRef} = timer:send_interval(1000, expire_leases),
+    {ok, #state{w = W, lease_expire_ref = LeaseExpireRef}};
+
+init([W, no_expire]) ->
+    {ok, #state{w = W, lease_expire_ref = undefined}}.
 
 handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
     {reply, {ok, [node() | Nodes], State#state.w}, State};
+
+%%
+%% LOCKING
+%%
 
 handle_call({request_lock, Key, Pid, Tag}, _From,
             #state{pending = Pending} = State) ->
@@ -139,10 +143,11 @@ handle_call({commit_lock, _Tag, Key, Pid}, _From,
     %% assumes that a quorum was reached in Phase 1. Deletes any
     %% pending locks
 
+    %% TODO: don't crash the gen_server..
     not dict:is_key(Key, Db) orelse throw(already_locked),
 
     NewPending = lists:keydelete(Key, 2, Pending),
-    NewDb = dict:store(Key, {Pid, now()}, Db),
+    NewDb = dict:store(Key, {Pid, now_to_ms(), ?LEASE_LENGTH}, Db),
     {reply, ok, State#state{pending = NewPending, db = NewDb}};
 
 handle_call({abort_lock, Tag}, _From, #state{pending = Pending} = State) ->
@@ -154,29 +159,34 @@ handle_call({abort_lock, Tag}, _From, #state{pending = Pending} = State) ->
     end;
 
 
+%%
+%% LEASES
+%%
 
-handle_call({extend_lease, Key, Pid}, _From, #state{db = Db, leases = Leases} = State) ->
+handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
+            #state{db = Db} = State) ->
     case dict:find(Key, State#state.db) of
-        {ok, {Pid, OldExpireTime}} ->
-            NewExpireTime = lease_expire_time(),
-            NewLeases = insert_lease(NewExpireTime, Key,
-                                     delete_lease(OldExpireTime, Key, Leases)),
-            NewDb = dict:store(Key, {Pid, NewExpireTime}, Db),
-            {reply, ok, State#state{db = NewDb, leases = NewLeases}};
+        {ok, {Pid, StartTime, LeaseLength}} ->
+            error_logger:info_msg("now: ~p, starttime: ~p~n", [now_to_ms(), StartTime]),
+            case is_expired(StartTime, LeaseLength) of
+                true ->
+                    {reply, {error, already_expired}, State};
+                false ->
+                    NewDb = dict:store(Key,
+                                       {Pid, StartTime, LeaseLength + ExtendLength},
+                                       Db),
+                    {reply, ok, State#state{db = NewDb}}
+            end;
 
         {ok, _OtherPid} ->
             {reply, {error, not_owner}, State};
         error ->
-            ExpireTime = lease_expire_time(),
-            NewLeases = insert_lease(ExpireTime, Key, Leases),
-            NewDb = dict:store(Key, {Pid, ExpireTime}, Db),
-
-            {reply, ok, State#state{leases = NewLeases, db = NewDb}}
+            {reply, {error, no_key}, State}
     end;
 
 handle_call({get_pid, Key}, _From, State) ->
     Reply = case dict:find(Key, State#state.db) of
-                {ok, {Pid, _}} ->
+                {ok, {Pid, _, _}} ->
                     {ok, Pid};
                 error ->
                     {error, not_found}
@@ -198,33 +208,31 @@ handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
     end;
 
 
-handle_call(get_debug_state, _From, #state{pending = Pending, db = Db} = State) ->
-    {reply, {ok, Pending, dict:to_list(Db)}, State}.
+handle_call(get_debug_state, _From, #state{pending = Pending, db = Db,
+                                           lease_expire_ref = Ref} = State) ->
+    {reply, {ok, Pending, dict:to_list(Db), Ref}, State}.
 
 handle_cast(_, State) ->
     {stop, badmsg, State}.
 
 
-handle_info(expire_leases, #state{db = Db, leases = Leases} = State) ->
-    Now = now_to_seconds(),
-    case gb_trees:is_empty(Leases) of
-        false ->
-            {ExpireTime, Keys, NewLeases} = gb_trees:take_smallest(Leases),
+handle_info(expire_leases, #state{db = Db} = State) ->
+    Now = now_to_ms(),
 
-            case ExpireTime < Now of
-                true ->
-                    error_logger:info_msg("leases expired: ~p~n", [Keys]),
-                    NewDb = lists:foldl(
-                              fun (Key, D) ->
-                                      dict:erase(Key, D)
-                              end, Db, Keys),
-                    {noreply, State#state{leases = NewLeases, db = NewDb}};
-                false ->
-                    {noreply, State}
-            end;
-        true ->
-            {noreply, State}
-    end;
+    Expired = dict:fold(
+                fun(Key, {_Pid, StartTime, LeaseLength}, Acc) ->
+                        case is_expired(StartTime, LeaseLength, Now) of
+                            true ->
+                                [Key | Acc];
+                            false ->
+                                Acc
+                        end
+                end, [], Db),
+
+    NewDb = lists:foldl(fun (Key, D) ->
+                                dict:erase(Key, D)
+                        end, Db, Expired),
+    {noreply, State#state{db = NewDb}};
 
 
 handle_info(_Info, State) ->
@@ -240,29 +248,19 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-now_to_seconds() ->
-    {MegaSeconds, Seconds, _} = now(),
-    MegaSeconds * 1000000 + Seconds.
+now_to_ms() ->
+    now_to_ms(now()).
 
-insert_lease(ExpireTime, Key, Leases) ->
-    case gb_trees:lookup(ExpireTime, Leases) of
-        {value, V} ->
-            gb_trees:update(ExpireTime, [Key | V], Leases);
-        none ->
-            gb_trees:insert(ExpireTime, [Key], Leases)
-    end.
-
-delete_lease(ExpireTime, Key, Leases) ->
-    case gb_trees:lookup(ExpireTime, Leases) of
-        {value, Keys} ->
-            gb_trees:update(ExpireTime, lists:delete(Key, Keys), Leases);
-        none ->
-            Leases
-    end.
-
-lease_expire_time() ->
-    now_to_seconds() + 3.
-
+now_to_ms({MegaSecs,Secs,MicroSecs}) ->
+	(MegaSecs*1000000 + Secs)*1000000 + MicroSecs.
 
 is_key_pending(Key, P) ->
     lists:keymember(Key, 2, P).
+
+is_expired(StartTime, Lease)->
+    is_expired(StartTime, Lease, now_to_ms()).
+is_expired(StartTime, Lease, NowMs)->
+    error_logger:info_msg("starttime: ~p, now: ~p, diff: ~p~n",
+                          [StartTime + Lease, NowMs,
+                           NowMs - (StartTime + Lease)]),
+    StartTime + Lease < NowMs.
