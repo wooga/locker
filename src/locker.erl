@@ -20,7 +20,8 @@
           pending = [], %% {tag, key, pid, now}
           db = dict:new(),
           commands = [],
-          lease_expire_ref
+          lease_expire_ref,
+          pending_expire_ref
 }).
 
 -define(LEASE_LENGTH, 2000).
@@ -101,8 +102,10 @@ get_debug_state() ->
 
 init([W]) ->
     {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
-    {ok, _} = timer:send_interval(1000, expire_pending),
-    {ok, #state{w = W, lease_expire_ref = LeaseExpireRef}};
+    {ok, PendingExpireRef} = timer:send_interval(1000, expire_pending),
+    {ok, #state{w = W,
+                lease_expire_ref = LeaseExpireRef,
+                pending_expire_ref = PendingExpireRef}};
 
 init([W, no_expire]) ->
     {ok, #state{w = W, lease_expire_ref = undefined}}.
@@ -208,9 +211,11 @@ handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
     end;
 
 
-handle_call(get_debug_state, _From, #state{pending = Pending, db = Db,
-                                           lease_expire_ref = Ref} = State) ->
-    {reply, {ok, Pending, dict:to_list(Db), Ref}, State}.
+handle_call(get_debug_state, _From, State) ->
+    {reply, {ok, State#state.pending,
+             dict:to_list(State#state.db),
+             State#state.lease_expire_ref,
+             State#state.pending_expire_ref}, State}.
 
 handle_cast(_, State) ->
     {stop, badmsg, State}.

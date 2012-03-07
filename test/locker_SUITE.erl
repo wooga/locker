@@ -31,9 +31,9 @@ quorum(_) ->
     ?line {ok, Pid} = rpc:call(B, locker, pid, [123]),
     ?line {ok, Pid} = rpc:call(C, locker, pid, [123]),
 
-    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _, _} = rpc:call(C, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -61,9 +61,9 @@ no_quorum_possible(_) ->
     {error, not_found} = rpc:call(B, locker, pid, [123]),
     {error, not_found} = rpc:call(C, locker, pid, [123]),
 
-    {ok, [], [], _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [], _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [], _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -126,9 +126,8 @@ setup(NodeNames) ->
     [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
 
     [begin
-         {ok, _, _, Ref} = rpc:call(N, locker, get_debug_state, []),
-         error_logger:info_msg("ref: ~p~n", [Ref]),
-         {ok, cancel} = rpc:call(N, timer, cancel, [Ref])
+         {ok, _, _, R1, R2} = rpc:call(N, locker, get_debug_state, []),
+         [{ok, cancel} = rpc:call(N, timer, cancel, [R]) || R <- [R1, R2]]
      end || N <- Nodes],
 
     Nodes.
