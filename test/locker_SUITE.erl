@@ -7,7 +7,8 @@ all() ->
     [
      quorum,
      no_quorum_possible,
-     lease_extend
+     lease_extend,
+     one_node_down
     ].
 %%     qc].
 
@@ -40,8 +41,6 @@ quorum(_) ->
 no_quorum_possible(_) ->
     [A, B, C] = setup([a, b, c]),
     ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
 
     Parent = self(),
     spawn(fun() ->
@@ -50,12 +49,9 @@ no_quorum_possible(_) ->
     spawn(fun() ->
                   Parent ! {2, catch rpc:call(B, locker, lock, [123, Parent])}
           end),
-    spawn(fun() ->
-                  Parent ! {3, catch rpc:call(C, locker, lock, [123, Parent])}
-          end),
+
     receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
     receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
-    receive {3, P3} -> P3 after 1000 -> throw(timeout) end,
 
     {error, not_found} = rpc:call(A, locker, pid, [123]),
     {error, not_found} = rpc:call(B, locker, pid, [123]),
@@ -64,6 +60,27 @@ no_quorum_possible(_) ->
     {ok, [], [], _, _} = rpc:call(A, locker, get_debug_state, []),
     {ok, [], [], _, _} = rpc:call(B, locker, get_debug_state, []),
     {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
+
+    teardown([A, B, C]).
+
+one_node_down(_) ->
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
+    slave:stop(C),
+
+    Pid = self(),
+    spawn(fun() ->
+                  Pid ! {1, catch rpc:call(A, locker, lock, [123, Pid])}
+          end),
+    receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
+
+    ?line {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    ?line {ok, Pid} = rpc:call(B, locker, pid, [123]),
+
+    {ok, [], [{123, {Pid, _, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -121,7 +138,8 @@ lease_extend(_) ->
 
 
 setup(NodeNames) ->
-    Nodes = [element(2, slave:start(list_to_atom(net_adm:localhost()), N)) || N <- NodeNames],
+    Nodes = [element(2, slave:start_link(list_to_atom(net_adm:localhost()), N))
+             || N <- NodeNames],
 
     [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
 

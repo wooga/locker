@@ -42,8 +42,9 @@ lock(Key, Pid) ->
         {ok, Nodes, W} ->
             error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
-            {Tag, RequestReplies, _BadNodes} = request_lock(Nodes, Key, Pid),
-            error_logger:info_msg("request replies: ~p~n", [RequestReplies]),
+            {Tag, RequestReplies, BadNodes} = request_lock(Nodes, Key, Pid),
+            error_logger:info_msg("request replies: ~p~nbadnodes: ~p~n",
+                                  [RequestReplies, BadNodes]),
 
             case ok_responses(RequestReplies) of
                 OkNodes when length(OkNodes) >= W ->
