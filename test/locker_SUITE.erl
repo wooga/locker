@@ -5,8 +5,8 @@
 
 all() ->
     [
-     %% quorum,
-     %% no_quorum_possible
+     quorum,
+     no_quorum_possible,
      lease_extend
     ].
 %%     qc].
@@ -31,9 +31,9 @@ quorum(_) ->
     ?line {ok, Pid} = rpc:call(B, locker, pid, [123]),
     ?line {ok, Pid} = rpc:call(C, locker, pid, [123]),
 
-    {ok, [], [{123, {Pid, _}}]} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}]} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}]} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _, _}}], _} = rpc:call(C, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -61,9 +61,9 @@ no_quorum_possible(_) ->
     {error, not_found} = rpc:call(B, locker, pid, [123]),
     {error, not_found} = rpc:call(C, locker, pid, [123]),
 
-    {ok, [], []} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], []} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], []} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [], _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [], _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [], _} = rpc:call(C, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
