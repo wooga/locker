@@ -5,8 +5,8 @@
 %% API
 -export([start_link/1, add_node/1]).
 
--export([lock/2, extend_lease/2]).
--export([request_lock/3, commit_lock/4, abort_lock/2]).
+-export([lock/2, lock/3, extend_lease/3]).
+-export([request_lock/3, commit_lock/5, abort_lock/2]).
 -export([get_nodes/0, pid/1, get_debug_state/0]).
 
 
@@ -37,30 +37,29 @@ get_nodes() ->
     gen_server:call(?MODULE, get_nodes).
 
 lock(Key, Pid) ->
+    lock(Key, Pid, ?LEASE_LENGTH).
+
+lock(Key, Pid, LeaseLength) ->
     error_logger:info_msg("acquiring lock~n"),
-    case get_nodes() of
-        {ok, Nodes, W} ->
-            error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
+    {ok, Nodes, W} = get_nodes(),
+    error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
-            {Tag, RequestReplies, BadNodes} = request_lock(Nodes, Key, Pid),
-            error_logger:info_msg("request replies: ~p~nbadnodes: ~p~n",
-                                  [RequestReplies, BadNodes]),
+    {Tag, RequestReplies, BadNodes} = request_lock(Nodes, Key, Pid),
+    error_logger:info_msg("request replies: ~p~nbadnodes: ~p~n",
+                          [RequestReplies, BadNodes]),
 
-            case ok_responses(RequestReplies) of
-                OkNodes when length(OkNodes) >= W ->
-                    %% Commit on all nodes
-                    {CommitReplies, _} = commit_lock(Nodes, Tag, Key, Pid),
-                    error_logger:info_msg("commit replies: ~p~n", [CommitReplies]),
-                    ok;
-                _ ->
-                    {AbortReplies, _} = abort_lock(Nodes, Tag),
-                    error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
-                    {error, no_quorum}
-            end;
-
-        {error, minority} ->
-            {error, minority}
+    case ok_responses(RequestReplies) of
+        OkNodes when length(OkNodes) >= W ->
+            %% Commit on all nodes
+            {CommitReplies, _} = commit_lock(Nodes, Tag, Key, Pid, LeaseLength),
+            error_logger:info_msg("commit replies: ~p~n", [CommitReplies]),
+            {ok, W, length(OkNodes), length(ok_responses(CommitReplies))};
+        _ ->
+            {AbortReplies, _} = abort_lock(Nodes, Tag),
+            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {error, no_quorum}
     end.
+
 
 ok_responses(Replies) ->
     [R || {_, ok} = R <- Replies].
@@ -71,8 +70,8 @@ request_lock(Nodes, Key, Pid) ->
                                             {request_lock, Key, Pid, Tag}, 1000),
     {Tag, Replies, Down}.
 
-commit_lock(Nodes, Tag, Key, Pid) ->
-    gen_server:multi_call(Nodes, locker, {commit_lock, Tag, Key, Pid}, 1000).
+commit_lock(Nodes, Tag, Key, Pid, LeaseLength) ->
+    gen_server:multi_call(Nodes, locker, {commit_lock, Tag, Key, Pid, LeaseLength}, 1000).
 
 abort_lock(Nodes, Tag) ->
     gen_server:multi_call(Nodes, locker, {abort_lock, Tag}, 1000).
@@ -83,15 +82,20 @@ pid(Key) ->
 add_node(Node) ->
     gen_server:call(?MODULE, {add_node, Node, true}).
 
-extend_lease(Key, Pid) ->
+%% @doc: Extends the lease for the lock on all nodes that are up. What
+%% really happens is that the expiration is scheduled for (now + lease
+%% time), to allow for nodes that just joined to set the correct
+%% expiration time without knowing the start time of the lease.
+extend_lease(Key, Pid, LeaseTime) ->
     {ok, Nodes, W} = get_nodes(),
     {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
-                                                 {extend_lease, Key, Pid, 2000}),
+                                                 {extend_lease, Key, Pid, LeaseTime}),
+    error_logger:info_msg("extend replies: ~p~n", [Replies]),
     case ok_responses(Replies) of
         N when length(N) >= W ->
             ok;
         _ ->
-            {error, not_all_ok}
+            {error, majority_not_ok}
     end.
 
 get_debug_state() ->
@@ -142,7 +146,7 @@ handle_call({request_lock, Key, Pid, Tag}, _From,
             end
     end;
 
-handle_call({commit_lock, _Tag, Key, Pid}, _From,
+handle_call({commit_lock, _Tag, Key, Pid, LeaseLength}, _From,
             #state{pending = Pending, db = Db} = State) ->
     %% Phase 2: Blindly create the lock if no lock is already set,
     %% assumes that a quorum was reached in Phase 1. Deletes any
@@ -152,7 +156,7 @@ handle_call({commit_lock, _Tag, Key, Pid}, _From,
     not dict:is_key(Key, Db) orelse throw(already_locked),
 
     NewPending = lists:keydelete(Key, 2, Pending),
-    NewDb = dict:store(Key, {Pid, now_to_ms(), ?LEASE_LENGTH}, Db),
+    NewDb = dict:store(Key, {Pid, now_to_ms() + LeaseLength}, Db),
     {reply, ok, State#state{pending = NewPending, db = NewDb}};
 
 handle_call({abort_lock, Tag}, _From, #state{pending = Pending} = State) ->
@@ -171,13 +175,13 @@ handle_call({abort_lock, Tag}, _From, #state{pending = Pending} = State) ->
 handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
             #state{db = Db} = State) ->
     case dict:find(Key, State#state.db) of
-        {ok, {Pid, StartTime, LeaseLength}} ->
-            case is_expired(StartTime, LeaseLength) of
+        {ok, {Pid, ExpireTime}} ->
+            case is_expired(ExpireTime) of
                 true ->
                     {reply, {error, already_expired}, State};
                 false ->
                     NewDb = dict:store(Key,
-                                       {Pid, StartTime, LeaseLength + ExtendLength},
+                                       {Pid, now_to_ms() + ExtendLength},
                                        Db),
                     {reply, ok, State#state{db = NewDb}}
             end;
@@ -185,12 +189,13 @@ handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
         {ok, _OtherPid} ->
             {reply, {error, not_owner}, State};
         error ->
-            {reply, {error, no_key}, State}
+            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength}, Db),
+            {reply, ok, State#state{db = NewDb}}
     end;
 
 handle_call({get_pid, Key}, _From, State) ->
     Reply = case dict:find(Key, State#state.db) of
-                {ok, {Pid, _, _}} ->
+                {ok, {Pid, _}} ->
                     {ok, Pid};
                 error ->
                     {error, not_found}
@@ -226,8 +231,8 @@ handle_info(expire_leases, #state{db = Db} = State) ->
     Now = now_to_ms(),
 
     Expired = dict:fold(
-                fun(Key, {_Pid, StartTime, LeaseLength}, Acc) ->
-                        case is_expired(StartTime, LeaseLength, Now) of
+                fun(Key, {_Pid, ExpireTime}, Acc) ->
+                        case is_expired(ExpireTime, Now) of
                             true ->
                                 [Key | Acc];
                             false ->
@@ -268,12 +273,13 @@ now_to_ms() ->
     now_to_ms(now()).
 
 now_to_ms({MegaSecs,Secs,MicroSecs}) ->
-	(MegaSecs*1000000 + Secs)*1000000 + MicroSecs.
+    (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
 
 is_key_pending(Key, P) ->
     lists:keymember(Key, 2, P).
 
-is_expired(StartTime, Lease)->
-    is_expired(StartTime, Lease, now_to_ms()).
-is_expired(StartTime, Lease, NowMs)->
-    StartTime + Lease < NowMs.
+is_expired(StartTime)->
+    is_expired(StartTime, now_to_ms()).
+
+is_expired(ExpireTime, NowMs)->
+    ExpireTime < NowMs.
