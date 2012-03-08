@@ -58,7 +58,9 @@ expiration to `now() + lease_length`, which means that the user needs
 to account for the skew when extending the lease. With leases in the
 order of minutes, the skew should be very small.
 
-Extending the lease is used to replicate the lock to new nodes.
+When a lease is extended, it is gossiped to the other nodes in the
+cluster which will update their local copy if they don't already have
+the key. This is used to bring new nodes in sync.
 
 
 ### Adding new nodes

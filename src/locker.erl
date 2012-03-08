@@ -193,8 +193,9 @@ handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
                 true ->
                     {reply, {error, already_expired}, State};
                 false ->
-                    NewDb = dict:store(Key,
-                                       {Pid, now_to_ms() + ExtendLength},
+                    gen_server:abcast(State#state.nodes, locker,
+                                    {extended_lease, node(), Key, Pid, ExtendLength}),
+                    NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength},
                                        Db),
                     {reply, ok, State#state{db = NewDb}}
             end;
@@ -202,8 +203,7 @@ handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
         {ok, _OtherPid} ->
             {reply, {error, not_owner}, State};
         error ->
-            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength}, Db),
-            {reply, ok, State#state{db = NewDb}}
+            {reply, {error, not_found}, State}
     end;
 
 
@@ -256,8 +256,20 @@ handle_call(get_debug_state, _From, State) ->
              State#state.lease_expire_ref,
              State#state.pending_expire_ref}, State}.
 
-handle_cast(_, State) ->
-    {stop, badmsg, State}.
+%%
+%% ASYNCHRONOUS LOCKER-TO-LOCKER
+%%
+
+handle_cast({extended_lease, FromNode, Key, Pid, ExtendLength}, #state{db = Db} = State) ->
+    error_logger:info_msg("got gossip from ~p: extend lease ~p~n", [FromNode, Key]),
+    case dict:is_key(Key, Db) of
+        true ->
+            {noreply, State};
+        false ->
+            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength},
+                               Db),
+            {noreply, State#state{db = NewDb}}
+    end.
 
 
 handle_info(expire_leases, #state{db = Db} = State) ->

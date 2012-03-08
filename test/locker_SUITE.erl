@@ -110,10 +110,7 @@ extend_propagates(_) ->
     ok = rpc:call(A, locker, add_node, [B]),
 
     Pid = self(),
-    spawn(fun() ->
-                  Pid ! {1, catch rpc:call(A, locker, lock, [123, Pid])}
-          end),
-    receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
 
     {ok, Pid} = rpc:call(A, locker, pid, [123]),
     {ok, Pid} = rpc:call(B, locker, pid, [123]),
@@ -124,6 +121,10 @@ extend_propagates(_) ->
 
     ok = rpc:call(A, locker, add_node, [C]),
     ok = rpc:call(B, locker, add_node, [C]),
+
+    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
 
