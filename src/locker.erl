@@ -3,9 +3,9 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1, add_node/1]).
+-export([start_link/1, add_node/1, set_w/1]).
 
--export([lock/2, lock/3, extend_lease/3]).
+-export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([request_lock/3, commit_lock/5, abort_lock/2]).
 -export([get_nodes/0, pid/1, get_debug_state/0]).
 
@@ -36,6 +36,9 @@ start_link(W) ->
 get_nodes() ->
     gen_server:call(?MODULE, get_nodes).
 
+set_w(W) when is_integer(W) ->
+    gen_server:call(?MODULE, {set_w, W}).
+
 lock(Key, Pid) ->
     lock(Key, Pid, ?LEASE_LENGTH).
 
@@ -59,6 +62,16 @@ lock(Key, Pid, LeaseLength) ->
             error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
             {error, no_quorum}
     end.
+
+release(Key, Pid) ->
+    error_logger:info_msg("releasing lock~n"),
+    {ok, Nodes, W} = get_nodes(),
+
+    {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
+                                                 {release, Key, Pid}, 1000),
+    error_logger:info_msg("release replies: ~p~n", [Replies]),
+    ok.
+
 
 
 ok_responses(Replies) ->
@@ -117,6 +130,9 @@ init([W, no_expire]) ->
 
 handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
     {reply, {ok, [node() | Nodes], State#state.w}, State};
+
+handle_call({set_w, W}, _From, State) ->
+    {reply, ok, State#state{w = W}};
 
 %%
 %% LOCKING
@@ -192,6 +208,19 @@ handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
             NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength}, Db),
             {reply, ok, State#state{db = NewDb}}
     end;
+
+
+handle_call({release, Key, Pid}, _From, #state{db = Db} = State) ->
+    case dict:find(Key, State#state.db) of
+        {ok, {Pid, _}} ->
+            NewDb = dict:erase(Key, Db),
+            {reply, ok, State#state{db = NewDb}};
+        {ok, {OtherPid, _}} ->
+            {reply, {error, not_owner}, State};
+        error ->
+            {reply, {error, not_found}, State}
+    end;
+
 
 handle_call({get_pid, Key}, _From, State) ->
     Reply = case dict:find(Key, State#state.db) of

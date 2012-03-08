@@ -5,6 +5,7 @@
 
 all() ->
     [
+     api,
      quorum,
      no_quorum_possible,
      lease_extend,
@@ -12,6 +13,25 @@ all() ->
      extend_propagates
     ].
 %%     qc].
+
+api(_) ->
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
+
+    {ok, Nodes, 2} = rpc:call(A, locker, get_nodes, []),
+    [A, B, C] = lists:sort(Nodes),
+
+    ok = rpc:call(A, locker, set_w, [3]),
+    ok = rpc:call(A, locker, set_w, [2]),
+
+    {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
+    slave:stop(C),
+    ok = rpc:call(A, locker, release, [123, self()]),
+    {ok, 2, 2, 2} = rpc:call(B, locker, lock, [123, self()]),
+
+    teardown([A, B, C]).
 
 quorum(_) ->
     [A, B, C] = setup([a, b, c]),
@@ -51,8 +71,8 @@ no_quorum_possible(_) ->
                   Parent ! {2, catch rpc:call(B, locker, lock, [123, Parent])}
           end),
 
-    receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
-    receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
+    {error, no_quorum} = receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
+    {error, no_quorum} = receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
 
     {error, not_found} = rpc:call(A, locker, pid, [123]),
     {error, not_found} = rpc:call(B, locker, pid, [123]),
