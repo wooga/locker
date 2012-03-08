@@ -65,17 +65,12 @@ lock(Key, Pid, LeaseLength) ->
 
 release(Key, Pid) ->
     error_logger:info_msg("releasing lock~n"),
-    {ok, Nodes, W} = get_nodes(),
-
+    {ok, Nodes, _W} = get_nodes(),
     {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
                                                  {release, Key, Pid}, 1000),
     error_logger:info_msg("release replies: ~p~n", [Replies]),
     ok.
 
-
-
-ok_responses(Replies) ->
-    [R || {_, ok} = R <- Replies].
 
 request_lock(Nodes, Key, Pid) ->
     Tag = make_ref(),
@@ -122,17 +117,10 @@ init([W]) ->
     {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
     {ok, PendingExpireRef} = timer:send_interval(1000, expire_pending),
     {ok, #state{w = W,
+                nodes = ordsets:new(),
                 lease_expire_ref = LeaseExpireRef,
-                pending_expire_ref = PendingExpireRef}};
+                pending_expire_ref = PendingExpireRef}}.
 
-init([W, no_expire]) ->
-    {ok, #state{w = W, lease_expire_ref = undefined}}.
-
-handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
-    {reply, {ok, [node() | Nodes], State#state.w}, State};
-
-handle_call({set_w, W}, _From, State) ->
-    {reply, ok, State#state{w = W}};
 
 %%
 %% LOCKING
@@ -215,12 +203,22 @@ handle_call({release, Key, Pid}, _From, #state{db = Db} = State) ->
         {ok, {Pid, _}} ->
             NewDb = dict:erase(Key, Db),
             {reply, ok, State#state{db = NewDb}};
-        {ok, {OtherPid, _}} ->
+        {ok, {_OtherPid, _}} ->
             {reply, {error, not_owner}, State};
         error ->
             {reply, {error, not_found}, State}
     end;
 
+
+%%
+%% ADMINISTRATION
+%%
+
+handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
+    {reply, {ok, [node() | Nodes], State#state.w}, State};
+
+handle_call({set_w, W}, _From, State) ->
+    {reply, ok, State#state{w = W}};
 
 handle_call({get_pid, Key}, _From, State) ->
     Reply = case dict:find(Key, State#state.db) of
@@ -232,18 +230,14 @@ handle_call({get_pid, Key}, _From, State) ->
     {reply, Reply, State};
 
 handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
-    case lists:member(Node, Nodes) of
-        true ->
-            {reply, ok, State};
-        false ->
-            case Reverse of
-                true ->
-                    ok = gen_server:call({locker, Node}, {add_node, node(), false});
-                false ->
-                    ok
-            end,
-            {reply, ok, State#state{nodes = [Node | Nodes]}}
-    end;
+    NewNodes = ordsets:add_element(Node, Nodes),
+
+    case Reverse of
+        true  -> ok = gen_server:call({locker, Node}, {add_node, node(), false});
+        false -> ok
+    end,
+
+    {reply, ok, State#state{nodes = NewNodes}};
 
 
 handle_call(get_debug_state, _From, State) ->
@@ -258,7 +252,6 @@ handle_cast(_, State) ->
 
 handle_info(expire_leases, #state{db = Db} = State) ->
     Now = now_to_ms(),
-
     Expired = dict:fold(
                 fun(Key, {_Pid, ExpireTime}, Acc) ->
                         case is_expired(ExpireTime, Now) of
@@ -268,7 +261,6 @@ handle_info(expire_leases, #state{db = Db} = State) ->
                                 Acc
                         end
                 end, [], Db),
-
 
     NewDb = lists:foldl(fun (Key, D) ->
                                 dict:erase(Key, D)
@@ -312,3 +304,6 @@ is_expired(StartTime)->
 
 is_expired(ExpireTime, NowMs)->
     ExpireTime < NowMs.
+
+ok_responses(Replies) ->
+    [R || {_, ok} = R <- Replies].
