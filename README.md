@@ -1,16 +1,17 @@
 ## locker
 
-The goal `locker` is to provide an atomic distributed "check and set"
+The goal of `locker` is to provide an atomic distributed "check and set"
 operation for short-lived locks.
 
 `locker` is a distributed de-centralized consistent in-memory
 key-value store written in Erlang. An entry expires after a certain
 amount of time, unless the lease is extended. This makes it a good
-practical option for locking, mutexes and leader election in a
-distributed.
+practical option for locks, mutexes and leader election in a
+distributed system.
 
 In terms of the CAP theorem, `locker` by default chooses consistency
-by requiring a quorum for every write.
+by requiring a quorum for every write. Leases expiring during a
+netsplit, can cause reads to to be inconsistent.
 
 There are three operations:
 
@@ -35,9 +36,9 @@ reached, the user will abort and delete any promises it received.
 ### Node failure
 
 "So, this is all fine and good, but what happens when a node
-fails?". Well, to make the system very simple to debug and implement,
-there is a timeout on every promise and every lock. If a promise is
-not converted into a lock, it is simply deleted.
+fails?". To make the system simple to implement, there is a timeout on
+every promise and every lock. If a promise is not converted into a
+lock in time, it is simply deleted.
 
 If the user process fails to extend the lease of it's lock, the lock
 expires without consulting any other node. If a node is partitioned
@@ -69,7 +70,9 @@ the cluster needs to already be connected or to connect without
 authentication.
 
 The new node will immediately start participating in writes. It will
-return empty for keys where the lease has not yet been extended.
+return empty for keys where the lease has not yet been extended,
+eventually catching up and returning identical responses to the other
+nodes.
 
 
 #### Assumptions
