@@ -10,9 +10,9 @@ all() ->
      no_quorum_possible,
      lease_extend,
      one_node_down,
-     extend_propagates
+     extend_propagates,
+     add_remove_node
     ].
-%%     qc].
 
 api(_) ->
     [A, B, C] = setup([a, b, c]),
@@ -171,22 +171,20 @@ lease_extend(_) ->
 
     ok.
 
+add_remove_node(_) ->
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
 
-%% qc(_) ->
-%%     ?line true = eqc:quickcheck(delay_prop()).
+    {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
+    ok = rpc:call(A, locker, remove_node, [C]),
+    ok = rpc:call(B, locker, release, [123, self()]),
 
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, self()]),
 
-%% delay_prop() ->
-%%     ?FORALL(D, choose(0, 25),
-%%             begin
-%%                 [A, B, C] = setup(),
-%%                 {ok, _Session1} = rpc:call(A, session, start_link, [123, 2]),
+    teardown([A, B, C]).
 
-%%                 timer:sleep(D),
-%%                 Res = rpc:call(A, gossiper, pid, [123]) =:= rpc:call(B, gossiper, pid, [123]),
-%%                 teardown([A, B, C]),
-%%                 Res
-%%             end).
 
 
 setup(Name) when is_atom(Name) ->

@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1, add_node/1, set_w/1]).
+-export([start_link/1, add_node/1, remove_node/1, set_w/1]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([request_lock/3, commit_lock/5, abort_lock/2]).
@@ -42,6 +42,12 @@ set_w(W) when is_integer(W) ->
 lock(Key, Pid) ->
     lock(Key, Pid, ?LEASE_LENGTH).
 
+%% @doc: Tries to acquire the lock. In case of unreachable nodes, the
+%% timeout is 1 second per node which might need tuning. Returns {ok,
+%% W, V, C} where W is the number of agreeing nodes required for a
+%% quorum, V is the number of nodes that voted in favor of this lock
+%% in the case of contention and C is the number of nodes who
+%% acknowledged commit of the lock successfully.
 lock(Key, Pid, LeaseLength) ->
     error_logger:info_msg("acquiring lock~n"),
     {ok, Nodes, W} = get_nodes(),
@@ -89,6 +95,9 @@ pid(Key) ->
 
 add_node(Node) ->
     gen_server:call(?MODULE, {add_node, Node, true}).
+
+remove_node(Node) ->
+    gen_server:call(?MODULE, {remove_node, Node, true}).
 
 %% @doc: Extends the lease for the lock on all nodes that are up. What
 %% really happens is that the expiration is scheduled for (now + lease
@@ -231,12 +240,13 @@ handle_call({get_pid, Key}, _From, State) ->
 
 handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
     NewNodes = ordsets:add_element(Node, Nodes),
+    not Reverse orelse gen_server:call({locker, Node}, {add_node, node(), false}),    {reply, ok, State#state{nodes = NewNodes}};
 
-    case Reverse of
-        true  -> ok = gen_server:call({locker, Node}, {add_node, node(), false});
-        false -> ok
-    end,
-
+handle_call({remove_node, Node, Reverse}, _From,
+            #state{nodes = Nodes} = State) ->
+    NewNodes = ordsets:del_element(Node, Nodes),
+    not Reverse orelse gen_server:call({locker, Node},
+                                       {remove_node, node(), false}),
     {reply, ok, State#state{nodes = NewNodes}};
 
 
@@ -273,7 +283,7 @@ handle_info(expire_pending, #state{pending = Pending} = State) ->
     Now = now_to_ms(),
 
     NewPending = [P || {_, _, _, StartTimeMs} = P <- Pending,
-                       StartTimeMs + 5000 > Now],
+                       StartTimeMs + 1000 > Now],
 
     {noreply, State#state{pending = NewPending}};
 
