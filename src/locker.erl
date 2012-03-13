@@ -1,12 +1,19 @@
--module(locker).
+%% @doc Distributed consistent key-value store
+%%
+%% Reads use the local copy, all data is replicated to all nodes.
+%%
+%% Writing is done in two phases, in the first phase the key is
+%% locked, if a quorum can be made, the value is written.
 
+-module(locker).
 -behaviour(gen_server).
+-author('Knut Nesheim <knutin@gmail.com>').
 
 %% API
 -export([start_link/1, add_node/1, remove_node/1, set_w/1]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
--export([request_lock/3, commit_lock/5, abort_lock/2]).
+-export([get_write_lock/3, do_write/5, release_write_lock/2]).
 -export([get_nodes/0, pid/1, get_debug_state/0]).
 
 
@@ -15,13 +22,27 @@
          terminate/2, code_change/3]).
 
 -record(state, {
+          %% w is the number of nodes required to make the write
+          %% quorum, this must be set manually for now as there is no
+          %% liveness checking of nodes and the introduction of a new
+          %% node is still very much a manual process
           w,
+
+          %% Nodes in the 'locker' cluster, where all writes should be sent
           nodes = [],
-          pending = [], %% {tag, key, pid, now}
+
+          %% The in memory database. For now it is a dict, if we want
+          %% higher performance, we could use an ETS table
           db = dict:new(),
-          commands = [],
+
+          %% A list of write-locks, only one lock per key is allowed,
+          %% but a list is used for performance as there will be few
+          %% concurrent locks
+          locks = [], %% {tag, key, pid, now}
+
+          %% Timer references
           lease_expire_ref,
-          pending_expire_ref
+          write_locks_expire_ref
 }).
 
 -define(LEASE_LENGTH, 2000).
@@ -48,23 +69,25 @@ lock(Key, Pid) ->
 %% quorum, V is the number of nodes that voted in favor of this lock
 %% in the case of contention and C is the number of nodes who
 %% acknowledged commit of the lock successfully.
-lock(Key, Pid, LeaseLength) ->
-    error_logger:info_msg("acquiring lock~n"),
+lock(Key, Value, LeaseLength) ->
     {ok, Nodes, W} = get_nodes(),
     error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
-    {Tag, RequestReplies, BadNodes} = request_lock(Nodes, Key, Pid),
+    %% Try getting the write lock on all nodes
+    {Tag, RequestReplies, BadNodes} = get_write_lock(Nodes, Key, not_found),
     error_logger:info_msg("request replies: ~p~nbadnodes: ~p~n",
                           [RequestReplies, BadNodes]),
 
     case ok_responses(RequestReplies) of
-        OkNodes when length(OkNodes) >= W ->
-            %% Commit on all nodes
-            {CommitReplies, _} = commit_lock(Nodes, Tag, Key, Pid, LeaseLength),
-            error_logger:info_msg("commit replies: ~p~n", [CommitReplies]),
-            {ok, W, length(OkNodes), length(ok_responses(CommitReplies))};
+        {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
+            %% Majority of nodes gave us the lock, go ahead and do the
+            %% write on all nodes. The write also releases the lock
+
+            {WriteReplies, _} = do_write(Nodes, Tag, Key, Value, LeaseLength),
+            error_logger:info_msg("write replies: ~p~n", [WriteReplies]),
+            {ok, W, length(OkNodes), length(OkNodes)};
         _ ->
-            {AbortReplies, _} = abort_lock(Nodes, Tag),
+            {AbortReplies, _} = release_write_lock(Nodes, Tag),
             error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
             {error, no_quorum}
     end.
@@ -78,17 +101,18 @@ release(Key, Pid) ->
     ok.
 
 
-request_lock(Nodes, Key, Pid) ->
+get_write_lock(Nodes, Key, Value) ->
     Tag = make_ref(),
-    {Replies, Down} = gen_server:multi_call(Nodes, locker,
-                                            {request_lock, Key, Pid, Tag}, 1000),
+    Request = {get_write_lock, Key, Value, Tag},
+    {Replies, Down} = gen_server:multi_call(Nodes, locker, Request, 1000),
     {Tag, Replies, Down}.
 
-commit_lock(Nodes, Tag, Key, Pid, LeaseLength) ->
-    gen_server:multi_call(Nodes, locker, {commit_lock, Tag, Key, Pid, LeaseLength}, 1000).
+do_write(Nodes, Tag, Key, Value, LeaseLength) ->
+    gen_server:multi_call(Nodes, locker, {write, Tag, Key, Value, LeaseLength}, 1000).
 
-abort_lock(Nodes, Tag) ->
-    gen_server:multi_call(Nodes, locker, {abort_lock, Tag}, 1000).
+
+release_write_lock(Nodes, Tag) ->
+    gen_server:multi_call(Nodes, locker, {release_write_lock, Tag}, 1000).
 
 pid(Key) ->
     gen_server:call(?MODULE, {get_pid, Key}).
@@ -103,17 +127,32 @@ remove_node(Node) ->
 %% really happens is that the expiration is scheduled for (now + lease
 %% time), to allow for nodes that just joined to set the correct
 %% expiration time without knowing the start time of the lease.
-extend_lease(Key, Pid, LeaseTime) ->
+extend_lease(Key, Value, LeaseTime) ->
     {ok, Nodes, W} = get_nodes(),
-    {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
-                                                 {extend_lease, Key, Pid, LeaseTime}),
-    error_logger:info_msg("extend replies: ~p~n", [Replies]),
-    case ok_responses(Replies) of
-        N when length(N) >= W ->
+
+    %% Try getting the write lock on all nodes
+    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
+    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
+                          [WriteLockReplies, BadNodes]),
+
+    case ok_responses(WriteLockReplies) of
+        {N, E} when length(N) >= W ->
+            error_logger:info_msg("lock replies: ~p, ~p~n", [N, E]),
+
+            Request = {extend_lease, Tag, Key, Value, LeaseTime},
+            {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker, Request, 1000),
+            {_, FailedExtended} = ok_responses(Replies),
+            error_logger:info_msg("extend replies: ~p~n", [Replies]),
+            release_write_lock(FailedExtended, Tag),
             ok;
         _ ->
+            {AbortReplies, _} = release_write_lock(Nodes, Tag),
+            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
             {error, majority_not_ok}
     end.
+
+
+
 
 get_debug_state() ->
     gen_server:call(?MODULE, get_debug_state).
@@ -124,83 +163,97 @@ get_debug_state() ->
 
 init([W]) ->
     {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
-    {ok, PendingExpireRef} = timer:send_interval(1000, expire_pending),
+    {ok, WriteLocksExpireRef} = timer:send_interval(1000, expire_locks),
     {ok, #state{w = W,
                 nodes = ordsets:new(),
                 lease_expire_ref = LeaseExpireRef,
-                pending_expire_ref = PendingExpireRef}}.
+                write_locks_expire_ref = WriteLocksExpireRef}}.
 
 
 %%
-%% LOCKING
+%% WRITE-LOCKS
 %%
 
-handle_call({request_lock, Key, Pid, Tag}, _From,
-            #state{pending = Pending} = State) ->
-    %% Phase 1: request lock on acquiring the key later. Should expire
-    %% after a short time if no commit or abort is received.
+handle_call({get_write_lock, Key, Value, Tag}, _From,
+            #state{locks = Locks} = State) ->
+    %% Phase 1: Grant a write lock on the key if the value in the
+    %% database is what the coordinator expects. If the atom
+    %% 'not_found' is given as the expected value, the lock is granted
+    %% if the key does not exist.
+    %%
+    %% Only one lock per key is allowed. Timeouts are triggered when
+    %% handling 'expire_locks'
 
-    case dict:find(Key, State#state.db) of
-        {ok, Pid} ->
-            Reply = {error, already_own_lock},
-            {reply, Reply, State};
-
-        {ok, OtherPid} ->
-            Reply = {error, already_registered, OtherPid},
-            {reply, Reply, State};
-
-        error ->
-            case is_key_pending(Key, Pending) of
-                true ->
-                    {reply, {error, already_pending}, State};
-                false ->
-                    NewPending = [{Tag, Key, Pid, now_to_ms()} | Pending],
-                    {reply, ok, State#state{pending = NewPending}}
+    case is_locked(Key, Locks) of
+        true ->
+            {reply, {error, already_locked}, State};
+        false ->
+            %% Only grant the lock if the current value is what the
+            %% coordinator expects
+            case dict:find(Key, State#state.db) of
+                {ok, {DbValue, _}} when DbValue =:= Value ->
+                    NewLocks = [{Tag, Key, Value, now_to_ms()} | Locks],
+                    {reply, ok, State#state{locks = NewLocks}};
+                error when Value =:= not_found->
+                    NewLocks = [{Tag, Key, Value, now_to_ms()} | Locks],
+                    {reply, ok, State#state{locks = NewLocks}};
+                _Other ->
+                    {reply, {error, not_expected_value}, State}
             end
     end;
 
-handle_call({commit_lock, _Tag, Key, Pid, LeaseLength}, _From,
-            #state{pending = Pending, db = Db} = State) ->
-    %% Phase 2: Blindly create the lock if no lock is already set,
-    %% assumes that a quorum was reached in Phase 1. Deletes any
-    %% pending locks
-
-    %% TODO: don't crash the gen_server..
-    not dict:is_key(Key, Db) orelse throw(already_locked),
-
-    NewPending = lists:keydelete(Key, 2, Pending),
-    NewDb = dict:store(Key, {Pid, now_to_ms() + LeaseLength}, Db),
-    {reply, ok, State#state{pending = NewPending, db = NewDb}};
-
-handle_call({abort_lock, Tag}, _From, #state{pending = Pending} = State) ->
-    case lists:keytake(Tag, 1, Pending) of
-        {value, {Tag, _Key, _Pid, _}, NewPending} ->
-            {reply, ok, State#state{pending = NewPending}};
+handle_call({release_write_lock, Tag}, _From, #state{locks = Locks} = State) ->
+    case lists:keytake(Tag, 1, Locks) of
+        {value, {Tag, _Key, _, _}, NewLocks} ->
+            {reply, ok, State#state{locks = NewLocks}};
         false ->
-            {reply, {error, pending_expired}, State}
+            {reply, {error, lock_expired}, State}
     end;
+
+
+%%
+%% DATABASE OPERATIONS
+%%
+
+handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
+            #state{locks = Locks, db = Db} = State) ->
+    %% Database write. LockTag might be a valid write-lock, in which
+    %% case it is deleted to avoid the extra round-trip of explicit
+    %% delete. If it is not valid, we assume the coordinator had a
+    %% quorum before writing.
+
+    NewLocks = lists:keydelete(LockTag, 1, Locks),
+    NewDb = dict:store(Key, {Value, now_to_ms() + LeaseLength}, Db),
+    {reply, ok, State#state{locks = NewLocks, db = NewDb}};
 
 
 %%
 %% LEASES
 %%
 
-handle_call({extend_lease, Key, Pid, ExtendLength}, _From,
-            #state{db = Db} = State) ->
+handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
+            #state{locks = Locks, db = Db} = State) ->
+    %% Extending a lease is a special case of a write with extra
+    %% validation. It also assumes a quorum in the coordinator. When a
+    %% lease is extended, it is gossiped to the other members to allow
+    %% new nodes to get up to speed on existing leases.
+
     case dict:find(Key, State#state.db) of
-        {ok, {Pid, ExpireTime}} ->
+        {ok, {Value, ExpireTime}} ->
             case is_expired(ExpireTime) of
                 true ->
                     {reply, {error, already_expired}, State};
                 false ->
                     gen_server:abcast(State#state.nodes, locker,
-                                    {extended_lease, node(), Key, Pid, ExtendLength}),
-                    NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength},
+                                      {extended_lease, node(), Key, Value, ExtendLength}),
+
+                    NewLocks = lists:keydelete(LockTag, 1, Locks),
+                    NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength},
                                        Db),
-                    {reply, ok, State#state{db = NewDb}}
+                    {reply, ok, State#state{locks = NewLocks, db = NewDb}}
             end;
 
-        {ok, _OtherPid} ->
+        {ok, _OtherValue} ->
             {reply, {error, not_owner}, State};
         error ->
             {reply, {error, not_found}, State}
@@ -217,6 +270,8 @@ handle_call({release, Key, Pid}, _From, #state{db = Db} = State) ->
         error ->
             {reply, {error, not_found}, State}
     end;
+
+
 
 
 %%
@@ -251,10 +306,12 @@ handle_call({remove_node, Node, Reverse}, _From,
 
 
 handle_call(get_debug_state, _From, State) ->
-    {reply, {ok, State#state.pending,
+    {reply, {ok, State#state.locks,
              dict:to_list(State#state.db),
              State#state.lease_expire_ref,
-             State#state.pending_expire_ref}, State}.
+             State#state.write_locks_expire_ref}, State}.
+
+
 
 %%
 %% ASYNCHRONOUS LOCKER-TO-LOCKER
@@ -266,10 +323,10 @@ handle_cast({extended_lease, FromNode, Key, Pid, ExtendLength}, #state{db = Db} 
         true ->
             {noreply, State};
         false ->
-            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength},
-                               Db),
+            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength}, Db),
             {noreply, State#state{db = NewDb}}
     end.
+
 
 
 handle_info(expire_leases, #state{db = Db} = State) ->
@@ -291,13 +348,10 @@ handle_info(expire_leases, #state{db = Db} = State) ->
     {noreply, State#state{db = NewDb}};
 
 
-handle_info(expire_pending, #state{pending = Pending} = State) ->
+handle_info(expire_locks, #state{locks = Locks} = State) ->
     Now = now_to_ms(),
-
-    NewPending = [P || {_, _, _, StartTimeMs} = P <- Pending,
-                       StartTimeMs + 1000 > Now],
-
-    {noreply, State#state{pending = NewPending}};
+    NewLocks = [L || {_, _, StartTimeMs} = L <- Locks, StartTimeMs + 1000 > Now],
+    {noreply, State#state{locks = NewLocks}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -318,7 +372,7 @@ now_to_ms() ->
 now_to_ms({MegaSecs,Secs,MicroSecs}) ->
     (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
 
-is_key_pending(Key, P) ->
+is_locked(Key, P) ->
     lists:keymember(Key, 2, P).
 
 is_expired(StartTime)->
@@ -328,4 +382,6 @@ is_expired(ExpireTime, NowMs)->
     ExpireTime < NowMs.
 
 ok_responses(Replies) ->
-    [R || {_, ok} = R <- Replies].
+    lists:partition(fun ({_, ok}) -> true;
+                        (_)        -> false
+                    end, Replies).

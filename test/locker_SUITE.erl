@@ -115,28 +115,30 @@ extend_propagates(_) ->
     {ok, Pid} = rpc:call(A, locker, pid, [123]),
     {ok, Pid} = rpc:call(B, locker, pid, [123]),
 
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _}}], _, _} = state(A),
+    {ok, [], [{123, {Pid, _}}], _, _} = state(B),
+    {ok, [], [], _, _} = state(C),
 
     ok = rpc:call(A, locker, add_node, [C]),
     ok = rpc:call(B, locker, add_node, [C]),
 
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, _}}], _, _} = state(A),
+    {ok, [], [{123, {Pid, _}}], _, _} = state(B),
+    {ok, [], [], _, _} = state(C),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
 
-    {ok, [], [{123, {Pid, ExA}}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, ExB}}], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, ExC}}], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, {Pid, ExA}}], _, _} = state(A),
+    {ok, [], [{123, {Pid, ExB}}], _, _} = state(B),
+    {ok, [], [{123, {Pid, ExC}}], _, _} = state(C),
 
     abs((ExA - ExB)) < 3 orelse throw(too_much_drift),
     abs((ExB - ExC)) < 3 orelse throw(too_much_drift),
     abs((ExA - ExC)) < 3 orelse throw(too_much_drift),
 
     teardown([A, B, C]).
+
+
 
 
 lease_extend(_) ->
@@ -206,3 +208,6 @@ setup(NodeNames) ->
 
 teardown(Nodes) ->
     lists:map(fun slave:stop/1, Nodes).
+
+state(N) ->
+    rpc:call(N, locker, get_debug_state, []).
