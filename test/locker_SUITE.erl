@@ -8,6 +8,7 @@ all() ->
      api,
      quorum,
      no_quorum_possible,
+     release,
      lease_extend,
      one_node_down,
      extend_propagates,
@@ -28,7 +29,7 @@ api(_) ->
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
     slave:stop(C),
-    ok = rpc:call(A, locker, release, [123, self()]),
+    {ok, 2, 2, 2} = rpc:call(A, locker, release, [123, self()]),
     {ok, 2, 2, 2} = rpc:call(B, locker, lock, [123, self()]),
 
     teardown([A, B, C]).
@@ -81,6 +82,25 @@ no_quorum_possible(_) ->
     {ok, [], [], _, _} = rpc:call(A, locker, get_debug_state, []),
     {ok, [], [], _, _} = rpc:call(B, locker, get_debug_state, []),
     {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
+
+    teardown([A, B, C]).
+
+release(_) ->
+    [A, B, C] = setup([a, b, c]),
+    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, add_node, [C]),
+    ok = rpc:call(B, locker, add_node, [C]),
+
+    Value = self(),
+    {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, Value]),
+
+    {ok, Value} = rpc:call(A, locker, pid, [123]),
+    {ok, Value} = rpc:call(B, locker, pid, [123]),
+    {ok, Value} = rpc:call(C, locker, pid, [123]),
+    slave:stop(A),
+    slave:stop(B),
+
+    {error, no_quorum} = rpc:call(C, locker, release, [123, Value]),
 
     teardown([A, B, C]).
 
@@ -182,7 +202,7 @@ add_remove_node(_) ->
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
     ok = rpc:call(A, locker, remove_node, [C]),
-    ok = rpc:call(B, locker, release, [123, self()]),
+    {ok, 2, 3, 3} = rpc:call(B, locker, release, [123, self()]),
 
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, self()]),
 

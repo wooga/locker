@@ -84,21 +84,65 @@ lock(Key, Value, LeaseLength) ->
             %% write on all nodes. The write also releases the lock
 
             {WriteReplies, _} = do_write(Nodes, Tag, Key, Value, LeaseLength),
+            {OkWrites, _BadWrites} = ok_responses(WriteReplies),
             error_logger:info_msg("write replies: ~p~n", [WriteReplies]),
-            {ok, W, length(OkNodes), length(OkNodes)};
+            {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
             {AbortReplies, _} = release_write_lock(Nodes, Tag),
             error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
             {error, no_quorum}
     end.
 
-release(Key, Pid) ->
+release(Key, Value) ->
     error_logger:info_msg("releasing lock~n"),
-    {ok, Nodes, _W} = get_nodes(),
-    {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker,
-                                                 {release, Key, Pid}, 1000),
-    error_logger:info_msg("release replies: ~p~n", [Replies]),
-    ok.
+    {ok, Nodes, W} = get_nodes(),
+
+    %% Try getting the write lock on all nodes
+    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
+    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
+                          [WriteLockReplies, BadNodes]),
+
+    case ok_responses(WriteLockReplies) of
+        {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
+            Request = {release, Key, Value, Tag},
+            {ReleaseReplies, _BadNodes} =
+                gen_server:multi_call(Nodes, locker, Request, 1000),
+
+            error_logger:info_msg("release replies: ~p~n", [ReleaseReplies]),
+            {OkWrites, _BadWrites} = ok_responses(ReleaseReplies),
+
+            {ok, W, length(OkNodes), length(OkWrites)};
+        _ ->
+            {AbortReplies, _} = release_write_lock(Nodes, Tag),
+            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {error, no_quorum}
+    end.
+
+%% @doc: Extends the lease for the lock on all nodes that are up. What
+%% really happens is that the expiration is scheduled for (now + lease
+%% time), to allow for nodes that just joined to set the correct
+%% expiration time without knowing the start time of the lease.
+extend_lease(Key, Value, LeaseTime) ->
+    {ok, Nodes, W} = get_nodes(),
+    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
+    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
+                          [WriteLockReplies, BadNodes]),
+
+    case ok_responses(WriteLockReplies) of
+        {N, E} when length(N) >= W ->
+            error_logger:info_msg("lock replies: ~p, ~p~n", [N, E]),
+
+            Request = {extend_lease, Tag, Key, Value, LeaseTime},
+            {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker, Request, 1000),
+            {_, FailedExtended} = ok_responses(Replies),
+            error_logger:info_msg("extend replies: ~p~n", [Replies]),
+            release_write_lock(FailedExtended, Tag),
+            ok;
+        _ ->
+            {AbortReplies, _} = release_write_lock(Nodes, Tag),
+            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {error, majority_not_ok}
+    end.
 
 
 get_write_lock(Nodes, Key, Value) ->
@@ -122,35 +166,6 @@ add_node(Node) ->
 
 remove_node(Node) ->
     gen_server:call(?MODULE, {remove_node, Node, true}).
-
-%% @doc: Extends the lease for the lock on all nodes that are up. What
-%% really happens is that the expiration is scheduled for (now + lease
-%% time), to allow for nodes that just joined to set the correct
-%% expiration time without knowing the start time of the lease.
-extend_lease(Key, Value, LeaseTime) ->
-    {ok, Nodes, W} = get_nodes(),
-
-    %% Try getting the write lock on all nodes
-    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
-    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
-                          [WriteLockReplies, BadNodes]),
-
-    case ok_responses(WriteLockReplies) of
-        {N, E} when length(N) >= W ->
-            error_logger:info_msg("lock replies: ~p, ~p~n", [N, E]),
-
-            Request = {extend_lease, Tag, Key, Value, LeaseTime},
-            {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker, Request, 1000),
-            {_, FailedExtended} = ok_responses(Replies),
-            error_logger:info_msg("extend replies: ~p~n", [Replies]),
-            release_write_lock(FailedExtended, Tag),
-            ok;
-        _ ->
-            {AbortReplies, _} = release_write_lock(Nodes, Tag),
-            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
-            {error, majority_not_ok}
-    end.
-
 
 
 
@@ -260,11 +275,14 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
     end;
 
 
-handle_call({release, Key, Pid}, _From, #state{db = Db} = State) ->
+handle_call({release, Key, Value, LockTag}, _From,
+            #state{locks = Locks, db = Db} = State) ->
     case dict:find(Key, State#state.db) of
-        {ok, {Pid, _}} ->
+        {ok, {Value, _}} ->
+            NewLocks = lists:keydelete(LockTag, 1, Locks),
             NewDb = dict:erase(Key, Db),
-            {reply, ok, State#state{db = NewDb}};
+            {reply, ok, State#state{locks = NewLocks, db = NewDb}};
+
         {ok, {_OtherPid, _}} ->
             {reply, {error, not_owner}, State};
         error ->
@@ -295,7 +313,8 @@ handle_call({get_pid, Key}, _From, State) ->
 
 handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
     NewNodes = ordsets:add_element(Node, Nodes),
-    not Reverse orelse gen_server:call({locker, Node}, {add_node, node(), false}),    {reply, ok, State#state{nodes = NewNodes}};
+    not Reverse orelse gen_server:call({locker, Node}, {add_node, node(), false}),
+    {reply, ok, State#state{nodes = NewNodes}};
 
 handle_call({remove_node, Node, Reverse}, _From,
             #state{nodes = Nodes} = State) ->
