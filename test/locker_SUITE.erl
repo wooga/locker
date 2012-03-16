@@ -23,8 +23,8 @@ api(_) ->
 
     {ok, Cluster, [], 2} = rpc:call(A, locker, get_nodes, []),
 
-    ok = rpc:call(A, locker, set_w, [3]),
-    ok = rpc:call(A, locker, set_w, [2]),
+    ok = rpc:call(A, locker, set_w, [[A], 3]),
+    {ok, Cluster, [], 3} = rpc:call(A, locker, get_nodes, []),
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
     slave:stop(C),

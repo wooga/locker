@@ -10,7 +10,7 @@
 -author('Knut Nesheim <knutin@gmail.com>').
 
 %% API
--export([start_link/1, remove_node/1, set_w/1]).
+-export([start_link/1, remove_node/1, set_w/2]).
 -export([set_nodes/3]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
@@ -61,9 +61,6 @@ start_link(W) ->
 
 get_nodes() ->
     gen_server:call(?MODULE, get_nodes).
-
-set_w(W) when is_integer(W) ->
-    gen_server:call(?MODULE, {set_w, W}).
 
 lock(Key, Pid) ->
     lock(Key, Pid, ?LEASE_LENGTH).
@@ -174,12 +171,12 @@ set_nodes(Cluster, Primaries, Replicas) ->
                                            {set_nodes, Primaries, Replicas}),
     ok.
 
-
+set_w(Cluster, W) when is_integer(W) ->
+    {_Replies, []} = gen_server:multi_call(Cluster, locker, {set_w, W}),
+    ok.
 
 remove_node(Node) ->
     gen_server:call(?MODULE, {remove_node, Node, true}).
-
-
 
 get_debug_state() ->
     gen_server:call(?MODULE, get_debug_state).
