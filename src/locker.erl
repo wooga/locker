@@ -73,12 +73,9 @@ lock(Key, Pid) ->
 %% acknowledged commit of the lock successfully.
 lock(Key, Value, LeaseLength) ->
     {ok, Nodes, Replicas, W} = get_nodes(),
-    error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
     %% Try getting the write lock on all nodes
-    {Tag, RequestReplies, BadNodes} = get_write_lock(Nodes, Key, not_found),
-    error_logger:info_msg("request replies: ~p~nbadnodes: ~p~n",
-                          [RequestReplies, BadNodes]),
+    {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, not_found),
 
     case ok_responses(RequestReplies) of
         {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
@@ -87,22 +84,17 @@ lock(Key, Value, LeaseLength) ->
 
             {WriteReplies, _} = do_write(Nodes ++ Replicas, Tag, Key, Value, LeaseLength),
             {OkWrites, _BadWrites} = ok_responses(WriteReplies),
-            error_logger:info_msg("write replies: ~p~n", [WriteReplies]),
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
-            {AbortReplies, _} = release_write_lock(Nodes, Tag),
-            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
             {error, no_quorum}
     end.
 
 release(Key, Value) ->
-    error_logger:info_msg("releasing lock~n"),
     {ok, Nodes, Replicas, W} = get_nodes(),
 
     %% Try getting the write lock on all nodes
-    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
-    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
-                          [WriteLockReplies, BadNodes]),
+    {Tag, WriteLockReplies, _BadNodes} = get_write_lock(Nodes, Key, Value),
 
     case ok_responses(WriteLockReplies) of
         {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
@@ -110,13 +102,11 @@ release(Key, Value) ->
             {ReleaseReplies, _BadNodes} =
                 gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
 
-            error_logger:info_msg("release replies: ~p~n", [ReleaseReplies]),
             {OkWrites, _BadWrites} = ok_responses(ReleaseReplies),
 
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
-            {AbortReplies, _} = release_write_lock(Nodes, Tag),
-            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
             {error, no_quorum}
     end.
 
@@ -126,24 +116,19 @@ release(Key, Value) ->
 %% expiration time without knowing the start time of the lease.
 extend_lease(Key, Value, LeaseTime) ->
     {ok, Nodes, Replicas, W} = get_nodes(),
-    {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
-    error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
-                          [WriteLockReplies, BadNodes]),
+    {Tag, WriteLockReplies, _BadNodes} = get_write_lock(Nodes, Key, Value),
 
     case ok_responses(WriteLockReplies) of
-        {N, E} when length(N) >= W ->
-            error_logger:info_msg("lock replies: ~p, ~p~n", [N, E]),
+        {N, _E} when length(N) >= W ->
 
             Request = {extend_lease, Tag, Key, Value, LeaseTime},
             {Replies, _BadNodes} =
                 gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
             {_, FailedExtended} = ok_responses(Replies),
-            error_logger:info_msg("extend replies: ~p~n", [Replies]),
             release_write_lock(FailedExtended, Tag),
             ok;
         _ ->
-            {AbortReplies, _} = release_write_lock(Nodes, Tag),
-            error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
             {error, no_quorum}
     end.
 
