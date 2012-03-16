@@ -144,7 +144,7 @@ extend_lease(Key, Value, LeaseTime) ->
         _ ->
             {AbortReplies, _} = release_write_lock(Nodes, Tag),
             error_logger:info_msg("abort replies: ~p~n", [AbortReplies]),
-            {error, majority_not_ok}
+            {error, no_quorum}
     end.
 
 
