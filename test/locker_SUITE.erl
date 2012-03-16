@@ -5,24 +5,23 @@
 
 all() ->
     [
-     api,
-     quorum,
-     no_quorum_possible,
-     release,
-     lease_extend,
-     one_node_down,
-     extend_propagates,
-     add_remove_node
+     %% api,
+     %% quorum,
+     no_quorum_possible
+     %% release,
+     %% lease_extend,
+     %% one_node_down,
+     %% extend_propagates,
+     %% add_remove_node,
+     %% replica,
+     %% promote
     ].
 
 api(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
-    {ok, Nodes, 2} = rpc:call(A, locker, get_nodes, []),
-    [A, B, C] = lists:sort(Nodes),
+    {ok, Cluster, [], 2} = rpc:call(A, locker, get_nodes, []),
 
     ok = rpc:call(A, locker, set_w, [3]),
     ok = rpc:call(A, locker, set_w, [2]),
@@ -35,10 +34,8 @@ api(_) ->
     teardown([A, B, C]).
 
 quorum(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
     Parent = self(),
     spawn(fun() ->
@@ -62,7 +59,7 @@ quorum(_) ->
 
 no_quorum_possible(_) ->
     [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, set_nodes, [[A, B], [A, B], []]),
 
     Parent = self(),
     spawn(fun() ->
@@ -86,10 +83,8 @@ no_quorum_possible(_) ->
     teardown([A, B, C]).
 
 release(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
     Value = self(),
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, Value]),
@@ -101,14 +96,13 @@ release(_) ->
     slave:stop(B),
 
     {error, no_quorum} = rpc:call(C, locker, release, [123, Value]),
+    {ok, Value} = rpc:call(C, locker, pid, [123]),
 
     teardown([A, B, C]).
 
 one_node_down(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
     slave:stop(C),
 
     Pid = self(),
@@ -127,24 +121,20 @@ one_node_down(_) ->
 
 extend_propagates(_) ->
     [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
+    ok = rpc:call(A, locker, set_nodes, [[A, B], [A, B], []]),
 
     Pid = self(),
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
 
     {ok, Pid} = rpc:call(A, locker, pid, [123]),
     {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {error, not_found} = rpc:call(C, locker, pid, [123]),
 
     {ok, [], [{123, {Pid, _}}], _, _} = state(A),
     {ok, [], [{123, {Pid, _}}], _, _} = state(B),
     {ok, [], [], _, _} = state(C),
 
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
-
-    {ok, [], [{123, {Pid, _}}], _, _} = state(A),
-    {ok, [], [{123, {Pid, _}}], _, _} = state(B),
-    {ok, [], [], _, _} = state(C),
+    ok = rpc:call(A, locker, set_nodes, [[A, B, C], [A, B], [C]]),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
 
@@ -159,13 +149,9 @@ extend_propagates(_) ->
     teardown([A, B, C]).
 
 
-
-
 lease_extend(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
     Pid = self(),
     {ok, _, _, _} = rpc:call(A, locker, lock, [123, Pid]),
@@ -195,19 +181,52 @@ lease_extend(_) ->
     ok.
 
 add_remove_node(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, add_node, [B]),
-    ok = rpc:call(A, locker, add_node, [C]),
-    ok = rpc:call(B, locker, add_node, [C]),
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
-    ok = rpc:call(A, locker, remove_node, [C]),
     {ok, 2, 3, 3} = rpc:call(B, locker, release, [123, self()]),
 
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], []]),
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, self()]),
 
     teardown([A, B, C]).
 
+replica(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
+
+    {ok, [A, B], [C], 2} = rpc:call(A, locker, get_nodes, []),
+    {ok, [A, B], [C], 2} = rpc:call(B, locker, get_nodes, []),
+    {ok, [A, B], [C], 2} = rpc:call(C, locker, get_nodes, []),
+
+    Pid = self(),
+    {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+
+    slave:stop(B),
+
+    {error, no_quorum} = rpc:call(A, locker, release, [123, Pid]),
+
+    teardown([A, B, C]).
+
+promote(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
+
+    Pid = self(),
+    {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, Pid} = rpc:call(A, locker, pid, [123]),
+    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+
+
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B, C], []]),
+    {ok, 2, 3, 3} = rpc:call(A, locker, release, [123, Pid]),
+
+    teardown([A, B, C]).
 
 
 setup(Name) when is_atom(Name) ->

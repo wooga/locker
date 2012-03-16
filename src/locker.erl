@@ -10,7 +10,8 @@
 -author('Knut Nesheim <knutin@gmail.com>').
 
 %% API
--export([start_link/1, add_node/1, remove_node/1, set_w/1]).
+-export([start_link/1, remove_node/1, set_w/1]).
+-export([set_nodes/3]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([get_write_lock/3, do_write/5, release_write_lock/2]).
@@ -28,8 +29,12 @@
           %% node is still very much a manual process
           w,
 
-          %% Nodes in the 'locker' cluster, where all writes should be sent
+          %% Nodes participating in the quorums
           nodes = [],
+
+          %% Replicas are receiving writes, but do not participate in
+          %% the quorums
+          replicas = [],
 
           %% The in memory database. For now it is a dict, if we want
           %% higher performance, we could use an ETS table
@@ -70,7 +75,7 @@ lock(Key, Pid) ->
 %% in the case of contention and C is the number of nodes who
 %% acknowledged commit of the lock successfully.
 lock(Key, Value, LeaseLength) ->
-    {ok, Nodes, W} = get_nodes(),
+    {ok, Nodes, Replicas, W} = get_nodes(),
     error_logger:info_msg("Nodes: ~p, W: ~p~n", [Nodes, W]),
 
     %% Try getting the write lock on all nodes
@@ -83,7 +88,7 @@ lock(Key, Value, LeaseLength) ->
             %% Majority of nodes gave us the lock, go ahead and do the
             %% write on all nodes. The write also releases the lock
 
-            {WriteReplies, _} = do_write(Nodes, Tag, Key, Value, LeaseLength),
+            {WriteReplies, _} = do_write(Nodes ++ Replicas, Tag, Key, Value, LeaseLength),
             {OkWrites, _BadWrites} = ok_responses(WriteReplies),
             error_logger:info_msg("write replies: ~p~n", [WriteReplies]),
             {ok, W, length(OkNodes), length(OkWrites)};
@@ -95,7 +100,7 @@ lock(Key, Value, LeaseLength) ->
 
 release(Key, Value) ->
     error_logger:info_msg("releasing lock~n"),
-    {ok, Nodes, W} = get_nodes(),
+    {ok, Nodes, Replicas, W} = get_nodes(),
 
     %% Try getting the write lock on all nodes
     {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
@@ -106,7 +111,7 @@ release(Key, Value) ->
         {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
             Request = {release, Key, Value, Tag},
             {ReleaseReplies, _BadNodes} =
-                gen_server:multi_call(Nodes, locker, Request, 1000),
+                gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
 
             error_logger:info_msg("release replies: ~p~n", [ReleaseReplies]),
             {OkWrites, _BadWrites} = ok_responses(ReleaseReplies),
@@ -123,7 +128,7 @@ release(Key, Value) ->
 %% time), to allow for nodes that just joined to set the correct
 %% expiration time without knowing the start time of the lease.
 extend_lease(Key, Value, LeaseTime) ->
-    {ok, Nodes, W} = get_nodes(),
+    {ok, Nodes, Replicas, W} = get_nodes(),
     {Tag, WriteLockReplies, BadNodes} = get_write_lock(Nodes, Key, Value),
     error_logger:info_msg("write lock replies: ~p~nbadnodes: ~p~n",
                           [WriteLockReplies, BadNodes]),
@@ -133,7 +138,8 @@ extend_lease(Key, Value, LeaseTime) ->
             error_logger:info_msg("lock replies: ~p, ~p~n", [N, E]),
 
             Request = {extend_lease, Tag, Key, Value, LeaseTime},
-            {Replies, _BadNodes} = gen_server:multi_call(Nodes, locker, Request, 1000),
+            {Replies, _BadNodes} =
+                gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
             {_, FailedExtended} = ok_responses(Replies),
             error_logger:info_msg("extend replies: ~p~n", [Replies]),
             release_write_lock(FailedExtended, Tag),
@@ -161,8 +167,14 @@ release_write_lock(Nodes, Tag) ->
 pid(Key) ->
     gen_server:call(?MODULE, {get_pid, Key}).
 
-add_node(Node) ->
-    gen_server:call(?MODULE, {add_node, Node, true}).
+%% @doc: Replaces the primary and replica node list on all nodes in
+%% the cluster. Assumes no failures.
+set_nodes(Cluster, Primaries, Replicas) ->
+    {_Replies, []} = gen_server:multi_call(Cluster, locker,
+                                           {set_nodes, Primaries, Replicas}),
+    ok.
+
+
 
 remove_node(Node) ->
     gen_server:call(?MODULE, {remove_node, Node, true}).
@@ -248,30 +260,28 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
 
 handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
             #state{locks = Locks, db = Db} = State) ->
-    %% Extending a lease is a special case of a write with extra
-    %% validation. It also assumes a quorum in the coordinator. When a
-    %% lease is extended, it is gossiped to the other members to allow
-    %% new nodes to get up to speed on existing leases.
+    %% Extending a lease sets a new expire time. As the coordinator
+    %% holds a write lock on the key, it is not necessary to perform
+    %% any validation.
 
     case dict:find(Key, State#state.db) of
-        {ok, {Value, ExpireTime}} ->
-            case is_expired(ExpireTime) of
-                true ->
-                    {reply, {error, already_expired}, State};
-                false ->
-                    gen_server:abcast(State#state.nodes, locker,
-                                      {extended_lease, node(), Key, Value, ExtendLength}),
-
-                    NewLocks = lists:keydelete(LockTag, 1, Locks),
-                    NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength},
-                                       Db),
-                    {reply, ok, State#state{locks = NewLocks, db = NewDb}}
-            end;
+        {ok, {Value, _}} ->
+            NewLocks = lists:keydelete(LockTag, 1, Locks),
+            NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength}, Db),
+            {reply, ok, State#state{locks = NewLocks, db = NewDb}};
 
         {ok, _OtherValue} ->
             {reply, {error, not_owner}, State};
         error ->
-            {reply, {error, not_found}, State}
+            %% Not found, so create it if we are a replica
+            case ordsets:is_element(node(), State#state.replicas) of
+                true ->
+                    NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength},
+                                       Db),
+                    {reply, ok, State#state{db = NewDb}};
+                false ->
+                    {reply, {error, not_found}, State}
+            end
     end;
 
 
@@ -296,8 +306,11 @@ handle_call({release, Key, Value, LockTag}, _From,
 %% ADMINISTRATION
 %%
 
-handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
-    {reply, {ok, [node() | Nodes], State#state.w}, State};
+handle_call(get_nodes, _From, State) ->
+    {reply, {ok,
+             State#state.nodes,
+             State#state.replicas,
+             State#state.w}, State};
 
 handle_call({set_w, W}, _From, State) ->
     {reply, ok, State#state{w = W}};
@@ -311,10 +324,10 @@ handle_call({get_pid, Key}, _From, State) ->
             end,
     {reply, Reply, State};
 
-handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
-    NewNodes = ordsets:add_element(Node, Nodes),
-    not Reverse orelse gen_server:call({locker, Node}, {add_node, node(), false}),
-    {reply, ok, State#state{nodes = NewNodes}};
+handle_call({set_nodes, Primaries, Replicas}, _From, State) ->
+    {reply, ok, State#state{nodes = ordsets:from_list(Primaries),
+                            replicas = ordsets:from_list(Replicas)}};
+
 
 handle_call({remove_node, Node, Reverse}, _From,
             #state{nodes = Nodes} = State) ->
@@ -332,27 +345,15 @@ handle_call(get_debug_state, _From, State) ->
 
 
 
-%%
-%% ASYNCHRONOUS LOCKER-TO-LOCKER
-%%
-
-handle_cast({extended_lease, FromNode, Key, Pid, ExtendLength}, #state{db = Db} = State) ->
-    error_logger:info_msg("got gossip from ~p: extend lease ~p~n", [FromNode, Key]),
-    case dict:is_key(Key, Db) of
-        true ->
-            {noreply, State};
-        false ->
-            NewDb = dict:store(Key, {Pid, now_to_ms() + ExtendLength}, Db),
-            {noreply, State#state{db = NewDb}}
-    end.
-
-
+handle_cast(_, State) ->
+    {stop, badmsg, State}.
 
 handle_info(expire_leases, #state{db = Db} = State) ->
     Now = now_to_ms(),
     Expired = dict:fold(
                 fun(Key, {_Pid, ExpireTime}, Acc) ->
-                        case is_expired(ExpireTime, Now) of
+                        case is_expired(ExpireTime, Now) andalso
+                            not is_locked(Key, State#state.locks) of
                             true ->
                                 [Key | Acc];
                             false ->
