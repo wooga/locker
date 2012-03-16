@@ -10,7 +10,7 @@
 -author('Knut Nesheim <knutin@gmail.com>').
 
 %% API
--export([start_link/1, add_node/1, remove_node/1, set_w/1, join/1]).
+-export([start_link/1, add_node/1, remove_node/1, set_w/1]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([get_write_lock/3, do_write/5, release_write_lock/2]).
@@ -39,11 +39,6 @@
           %% but a list is used for performance as there will be few
           %% concurrent locks
           locks = [], %% {tag, key, pid, now}
-
-          %% A boolean telling us if the node currently blocks
-          %% writes. When a new node is added to the cluster,
-          %% write-locks are not granted and writes are stopped.
-          allow_writes = false,
 
           %% Timer references
           lease_expire_ref,
@@ -166,54 +161,11 @@ release_write_lock(Nodes, Tag) ->
 pid(Key) ->
     gen_server:call(?MODULE, {get_pid, Key}).
 
-%% @doc: Connects the current node with the cluster, forming a fully
-%% connected cluster where the local node copies the db from the seed
-%% node. This operation will block all writes in the entire cluster
-%% during synchronization.
-join(SeedNode) ->
-    {ok, Nodes, _} = gen_server:call({?MODULE, SeedNode}, get_nodes, 500),
-    error_logger:info_msg("nodes according to seed: ~p~n", [Nodes]),
-    AllNodes = [node() | Nodes],
-
-    {BlockReplies, []} = gen_server:multi_call(AllNodes, locker, block_writes),
-    error_logger:info_msg("block replies: ~p~n", [BlockReplies]),
-
-    %% wait for write locks to be released
-    {CountReplies, []} = gen_server:multi_call(AllNodes, locker, num_write_locks),
-
-    EmptyNodes = lists:flatmap(fun ({N, {ok, 0}}) -> [N];
-                                   (_)            -> []
-                              end, CountReplies),
-    error_logger:info_msg("lock counts: ~p~n", [CountReplies]),
-    error_logger:info_msg("empty: ~p, all: ~p~n", [EmptyNodes, AllNodes]),
-    case lists:sort(EmptyNodes) =:= lists:sort(AllNodes) of
-        true ->
-            {ok, Db} = gen_server:call({?MODULE, SeedNode}, get_db, 500),
-            ok = gen_server:call(?MODULE, {replace_db, Db}, 500),
-
-            {AddNodeReplies, []} = gen_server:multi_call(Nodes, locker, {add_nodes, [node()]}),
-            error_logger:info_msg("add node replies: ~p~n", [AddNodeReplies]),
-            ok = gen_server:call(?MODULE, {add_nodes, Nodes}),
-
-            %% Update the write quorum
-
-            %% Allow writes
-
-            {AllowReplies, []} = gen_server:multi_call(AllNodes, locker, allow_writes),
-            error_logger:info_msg("allow replies: ~p~n", [AllowReplies]),
-
-            ok;
-        _ ->
-            {error, {write_locks_remaining, AllNodes -- EmptyNodes}}
-    end.
-
-
-
 add_node(Node) ->
-    gen_server:call(?MODULE, {add_nodes, [Node]}).
+    gen_server:call(?MODULE, {add_node, Node, true}).
 
 remove_node(Node) ->
-    gen_server:call(?MODULE, {remove_node, Node}).
+    gen_server:call(?MODULE, {remove_node, Node, true}).
 
 
 
@@ -236,9 +188,6 @@ init([W]) ->
 %%
 %% WRITE-LOCKS
 %%
-
-handle_call({get_write_lock, _, _, _}, _From, #state{allow_writes = false} = State) ->
-    {reply, {error, writes_not_allowed}, State};
 
 handle_call({get_write_lock, Key, Value, Tag}, _From,
             #state{locks = Locks} = State) ->
@@ -281,10 +230,6 @@ handle_call({release_write_lock, Tag}, _From, #state{locks = Locks} = State) ->
 %% DATABASE OPERATIONS
 %%
 
-
-handle_call({write, _, _, _, _}, _From, #state{allow_writes = false} = State) ->
-    {reply, {error, writes_not_allowed}, State};
-
 handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
             #state{locks = Locks, db = Db} = State) ->
     %% Database write. LockTag might be a valid write-lock, in which
@@ -295,13 +240,6 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
     NewLocks = lists:keydelete(LockTag, 1, Locks),
     NewDb = dict:store(Key, {Value, now_to_ms() + LeaseLength}, Db),
     {reply, ok, State#state{locks = NewLocks, db = NewDb}};
-
-
-handle_call(get_db, _From, State) ->
-    {reply, {ok, dict:to_list(State#state.db)}, State};
-
-handle_call({replace_db, Db}, _From, State) ->
-    {reply, ok, State#state{db = dict:from_list(Db)}};
 
 
 %%
@@ -358,16 +296,6 @@ handle_call({release, Key, Value, LockTag}, _From,
 %% ADMINISTRATION
 %%
 
-handle_call(block_writes, _From, State) ->
-    {reply, ok, State#state{allow_writes = false}};
-
-handle_call(allow_writes, _From, State) ->
-    {reply, ok, State#state{allow_writes = true}};
-
-handle_call(num_write_locks, _From, State) ->
-    {reply, {ok, length(State#state.locks)}, State};
-
-
 handle_call(get_nodes, _From, #state{nodes = Nodes} = State) ->
     {reply, {ok, [node() | Nodes], State#state.w}, State};
 
@@ -383,13 +311,16 @@ handle_call({get_pid, Key}, _From, State) ->
             end,
     {reply, Reply, State};
 
-handle_call({add_nodes, Ns}, _From, #state{nodes = Nodes} = State) ->
-    NewNodes = lists:foldl(fun ordsets:add_element/2, Nodes, Ns),
+handle_call({add_node, Node, Reverse}, _From, #state{nodes = Nodes} = State) ->
+    NewNodes = ordsets:add_element(Node, Nodes),
+    not Reverse orelse gen_server:call({locker, Node}, {add_node, node(), false}),
     {reply, ok, State#state{nodes = NewNodes}};
 
-handle_call({remove_node, Node}, _From,
+handle_call({remove_node, Node, Reverse}, _From,
             #state{nodes = Nodes} = State) ->
     NewNodes = ordsets:del_element(Node, Nodes),
+    not Reverse orelse gen_server:call({locker, Node},
+                                       {remove_node, node(), false}),
     {reply, ok, State#state{nodes = NewNodes}};
 
 

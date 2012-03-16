@@ -5,15 +5,14 @@
 
 all() ->
     [
-     %% api,
-     %% quorum,
-     %% no_quorum_possible,
-     %% release,
-     %% lease_extend,
-     %% one_node_down,
-     %% extend_propagates,
-     %% add_remove_node
-     join_empty
+     api,
+     quorum,
+     no_quorum_possible,
+     release,
+     lease_extend,
+     one_node_down,
+     extend_propagates,
+     add_remove_node
     ].
 
 api(_) ->
@@ -208,33 +207,6 @@ add_remove_node(_) ->
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, self()]),
 
     teardown([A, B, C]).
-
-
-join_empty(_) ->
-    [A, B, C] = setup([a, b, c]),
-
-    ok = rpc:call(A, locker, join, [B]),
-
-    {ok, [A, B], _} = rpc:call(A, locker, get_nodes, []),
-    {ok, [B, A], _} = rpc:call(B, locker, get_nodes, []),
-    {ok, [], [], _, _} = state(A),
-    {ok, [], [], _, _} = state(B),
-
-    throw(foo),
-    teardown([A, B, C]).
-
-
-
-
-join_existing(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, set_w, [1]),
-
-    ok = rpc:call(A, locker, lock, [123, self()]),
-
-    teardown([A, B, C]).
-
-
 
 
 
