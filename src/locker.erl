@@ -395,9 +395,6 @@ now_to_ms({MegaSecs,Secs,MicroSecs}) ->
 is_locked(Key, P) ->
     lists:keymember(Key, 2, P).
 
-is_expired(StartTime)->
-    is_expired(StartTime, now_to_ms()).
-
 is_expired(ExpireTime, NowMs)->
     ExpireTime < NowMs.
 
