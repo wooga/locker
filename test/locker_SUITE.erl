@@ -5,16 +5,16 @@
 
 all() ->
     [
-     %% api,
-     %% quorum,
-     no_quorum_possible
-     %% release,
-     %% lease_extend,
-     %% one_node_down,
-     %% extend_propagates,
-     %% add_remove_node,
-     %% replica,
-     %% promote
+     api,
+     quorum,
+     no_quorum_possible,
+     release,
+     lease_extend,
+     one_node_down,
+     extend_propagates,
+     add_remove_node,
+     replica,
+     promote
     ].
 
 api(_) ->
@@ -25,9 +25,13 @@ api(_) ->
 
     ok = rpc:call(A, locker, set_w, [[A], 3]),
     {ok, Cluster, [], 3} = rpc:call(A, locker, get_nodes, []),
+    ok = rpc:call(A, locker, set_w, [[A], 2]),
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
-    slave:stop(C),
+    %% slave:stop(C),
+    Pid = rpc:call(C, erlang, whereis, [locker]),
+    true = rpc:call(C, erlang, exit, [Pid, kill]),
+    false = rpc:call(C, erlang, is_process_alive, [Pid]),
     {ok, 2, 2, 2} = rpc:call(A, locker, release, [123, self()]),
     {ok, 2, 2, 2} = rpc:call(B, locker, lock, [123, self()]),
 
