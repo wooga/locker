@@ -3,6 +3,10 @@
 -include_lib("test_server/include/test_server.hrl").
 -include_lib("eqc/include/eqc.hrl").
 
+-define (EBIN_DIR, lists:flatten(
+    filename:dirname(filename:dirname(filename:absname(""))) ++
+    ["/ebin"])).
+
 all() ->
     [
      api,
@@ -237,7 +241,7 @@ setup(Name) when is_atom(Name) ->
     error_logger:info_msg("starting ~p~n", [Name]),
     {ok, Node} = slave:start_link(list_to_atom(net_adm:localhost()), Name),
 
-    true = rpc:call(Node, code, add_path, ["/home/knutin/git/locker/ebin"]),
+    true = rpc:call(Node, code, add_path, [?EBIN_DIR]),
     {ok, _} = rpc:call(Node, locker, start_link, [2]),
 
     {ok, _, _, R1, R2} = rpc:call(Node, locker, get_debug_state, []),
