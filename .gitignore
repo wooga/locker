@@ -1,0 +1,5 @@
+logs
+.eunit
+ebin
+deps
+*.beam
