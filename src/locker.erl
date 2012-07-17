@@ -295,17 +295,16 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
     end;
 
 
-handle_call({release, Key, Value, LockTag}, _From,
-            #state{locks = Locks} = State) ->
+handle_call({release, Key, Value, LockTag}, _From, #state{locks = Locks} = State) ->
     case ets:lookup(?DB, Key) of
         [{Key, Value, _Lease}] ->
             NewLocks = lists:keydelete(LockTag, 1, Locks),
             true = ets:delete(?DB, Key),
             {reply, ok, State#state{locks = NewLocks}};
 
-        {ok, {_OtherPid, _}} ->
+        [{Key, _OtherPid, _}] ->
             {reply, {error, not_owner}, State};
-        error ->
+        [] ->
             {reply, {error, not_found}, State}
     end;
 
