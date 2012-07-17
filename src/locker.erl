@@ -16,7 +16,7 @@
 -export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([dirty_read/1]).
 
--export([get_write_lock/3, do_write/5, release_write_lock/2]).
+-export([get_write_lock/4, do_write/6, release_write_lock/3]).
 -export([get_nodes/0, get_debug_state/0]).
 
 
@@ -59,10 +59,16 @@ start_link(W) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [W], []).
 
 get_nodes() ->
-    gen_server:call(?MODULE, get_nodes).
+    get_nodes(5000).
 
-lock(Key, Pid) ->
-    lock(Key, Pid, ?LEASE_LENGTH).
+get_nodes(Timeout) ->
+    gen_server:call(?MODULE, get_nodes, Timeout).
+
+lock(Key, Value) ->
+    lock(Key, Value, ?LEASE_LENGTH).
+
+lock(Key, Value, LeaseLength) ->
+    lock(Key, Value, LeaseLength, 5000).
 
 %% @doc: Tries to acquire the lock. In case of unreachable nodes, the
 %% timeout is 1 second per node which might need tuning. Returns {ok,
@@ -70,64 +76,73 @@ lock(Key, Pid) ->
 %% quorum, V is the number of nodes that voted in favor of this lock
 %% in the case of contention and C is the number of nodes who
 %% acknowledged commit of the lock successfully.
-lock(Key, Value, LeaseLength) ->
-    {ok, Nodes, Replicas, W} = get_nodes(),
+lock(Key, Value, LeaseLength, Timeout) ->
+    {ok, Nodes, Replicas, W} = get_nodes(Timeout),
 
     %% Try getting the write lock on all nodes
-    {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, not_found),
+    {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, not_found, Timeout),
 
     case ok_responses(RequestReplies) of
         {OkNodes, _} when length(OkNodes) >= W ->
             %% Majority of nodes gave us the lock, go ahead and do the
             %% write on all nodes. The write also releases the lock
 
-            {WriteReplies, _} = do_write(Nodes ++ Replicas, Tag, Key, Value, LeaseLength),
+            {WriteReplies, _} = do_write(Nodes ++ Replicas,
+                                         Tag, Key, Value,
+                                         LeaseLength, Timeout),
             {OkWrites, _} = ok_responses(WriteReplies),
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
-            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
             {error, no_quorum}
     end.
 
 release(Key, Value) ->
-    {ok, Nodes, Replicas, W} = get_nodes(),
+    release(Key, Value, 5000).
+
+release(Key, Value, Timeout) ->
+    {ok, Nodes, Replicas, W} = get_nodes(Timeout),
 
     %% Try getting the write lock on all nodes
-    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value),
+    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value, Timeout),
 
     case ok_responses(WriteLockReplies) of
         {OkNodes, _} when length(OkNodes) >= W ->
             Request = {release, Key, Value, Tag},
             {ReleaseReplies, _BadNodes} =
-                gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
+                gen_server:multi_call(Nodes ++ Replicas, locker, Request, Timeout),
 
             {OkWrites, _} = ok_responses(ReleaseReplies),
 
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
-            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
             {error, no_quorum}
     end.
+
+
+extend_lease(Key, Value, LeaseLength) ->
+    extend_lease(Key, Value, LeaseLength, 5000).
 
 %% @doc: Extends the lease for the lock on all nodes that are up. What
 %% really happens is that the expiration is scheduled for (now + lease
 %% time), to allow for nodes that just joined to set the correct
 %% expiration time without knowing the start time of the lease.
-extend_lease(Key, Value, LeaseTime) ->
-    {ok, Nodes, Replicas, W} = get_nodes(),
-    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value),
+extend_lease(Key, Value, LeaseLength, Timeout) ->
+    {ok, Nodes, Replicas, W} = get_nodes(Timeout),
+    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value, Timeout),
 
     case ok_responses(WriteLockReplies) of
         {N, _E} when length(N) >= W ->
 
-            Request = {extend_lease, Tag, Key, Value, LeaseTime},
+            Request = {extend_lease, Tag, Key, Value, LeaseLength},
             {Replies, _} =
-                gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
+                gen_server:multi_call(Nodes ++ Replicas, locker, Request, Timeout),
             {_, FailedExtended} = ok_responses(Replies),
-            release_write_lock(FailedExtended, Tag),
+            release_write_lock(FailedExtended, Tag, Timeout),
             ok;
         _ ->
-            {_AbortReplies, _} = release_write_lock(Nodes, Tag),
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
             {error, no_quorum}
     end.
 
@@ -147,18 +162,18 @@ dirty_read(Key) ->
 %% Helpers
 %%
 
-get_write_lock(Nodes, Key, Value) ->
+get_write_lock(Nodes, Key, Value, Timeout) ->
     Tag = make_ref(),
     Request = {get_write_lock, Key, Value, Tag},
-    {Replies, Down} = gen_server:multi_call(Nodes, locker, Request, 1000),
+    {Replies, Down} = gen_server:multi_call(Nodes, locker, Request, Timeout),
     {Tag, Replies, Down}.
 
-do_write(Nodes, Tag, Key, Value, LeaseLength) ->
-    gen_server:multi_call(Nodes, locker, {write, Tag, Key, Value, LeaseLength}, 1000).
+do_write(Nodes, Tag, Key, Value, LeaseLength, Timeout) ->
+    gen_server:multi_call(Nodes, locker, {write, Tag, Key, Value, LeaseLength}, Timeout).
 
 
-release_write_lock(Nodes, Tag) ->
-    gen_server:multi_call(Nodes, locker, {release_write_lock, Tag}, 1000).
+release_write_lock(Nodes, Tag, Timeout) ->
+    gen_server:multi_call(Nodes, locker, {release_write_lock, Tag}, Timeout).
 
 
 
