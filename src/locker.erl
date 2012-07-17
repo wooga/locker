@@ -77,12 +77,12 @@ lock(Key, Value, LeaseLength) ->
     {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, not_found),
 
     case ok_responses(RequestReplies) of
-        {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
+        {OkNodes, _} when length(OkNodes) >= W ->
             %% Majority of nodes gave us the lock, go ahead and do the
             %% write on all nodes. The write also releases the lock
 
             {WriteReplies, _} = do_write(Nodes ++ Replicas, Tag, Key, Value, LeaseLength),
-            {OkWrites, _BadWrites} = ok_responses(WriteReplies),
+            {OkWrites, _} = ok_responses(WriteReplies),
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
             {_AbortReplies, _} = release_write_lock(Nodes, Tag),
@@ -93,15 +93,15 @@ release(Key, Value) ->
     {ok, Nodes, Replicas, W} = get_nodes(),
 
     %% Try getting the write lock on all nodes
-    {Tag, WriteLockReplies, _BadNodes} = get_write_lock(Nodes, Key, Value),
+    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value),
 
     case ok_responses(WriteLockReplies) of
-        {OkNodes, _ErrorNodes} when length(OkNodes) >= W ->
+        {OkNodes, _} when length(OkNodes) >= W ->
             Request = {release, Key, Value, Tag},
             {ReleaseReplies, _BadNodes} =
                 gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
 
-            {OkWrites, _BadWrites} = ok_responses(ReleaseReplies),
+            {OkWrites, _} = ok_responses(ReleaseReplies),
 
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
@@ -115,13 +115,13 @@ release(Key, Value) ->
 %% expiration time without knowing the start time of the lease.
 extend_lease(Key, Value, LeaseTime) ->
     {ok, Nodes, Replicas, W} = get_nodes(),
-    {Tag, WriteLockReplies, _BadNodes} = get_write_lock(Nodes, Key, Value),
+    {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value),
 
     case ok_responses(WriteLockReplies) of
         {N, _E} when length(N) >= W ->
 
             Request = {extend_lease, Tag, Key, Value, LeaseTime},
-            {Replies, _BadNodes} =
+            {Replies, _} =
                 gen_server:multi_call(Nodes ++ Replicas, locker, Request, 1000),
             {_, FailedExtended} = ok_responses(Replies),
             release_write_lock(FailedExtended, Tag),
