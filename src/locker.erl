@@ -14,8 +14,10 @@
 -export([set_nodes/3]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
+-export([dirty_read/1]).
+
 -export([get_write_lock/3, do_write/5, release_write_lock/2]).
--export([get_nodes/0, pid/1, get_debug_state/0]).
+-export([get_nodes/0, get_debug_state/0]).
 
 
 %% gen_server callbacks
@@ -36,10 +38,6 @@
           %% the quorums
           replicas = [],
 
-          %% The in memory database. For now it is a dict, if we want
-          %% higher performance, we could use an ETS table
-          db = dict:new(),
-
           %% A list of write-locks, only one lock per key is allowed,
           %% but a list is used for performance as there will be few
           %% concurrent locks
@@ -51,6 +49,7 @@
 }).
 
 -define(LEASE_LENGTH, 2000).
+-define(DB, locker_db).
 
 %%%===================================================================
 %%% API
@@ -132,6 +131,21 @@ extend_lease(Key, Value, LeaseTime) ->
             {error, no_quorum}
     end.
 
+%% @doc: A dirty read does not create a read-quorum so consistency is
+%% not guaranteed. The value is read directly from a local ETS-table,
+%% so the performance should be very high.
+dirty_read(Key) ->
+    case ets:lookup(?DB, Key) of
+        [{Key, Value, _Lease}] ->
+            {ok, Value};
+        [] ->
+            {error, not_found}
+    end.
+
+
+%%
+%% Helpers
+%%
 
 get_write_lock(Nodes, Key, Value) ->
     Tag = make_ref(),
@@ -146,8 +160,7 @@ do_write(Nodes, Tag, Key, Value, LeaseLength) ->
 release_write_lock(Nodes, Tag) ->
     gen_server:multi_call(Nodes, locker, {release_write_lock, Tag}, 1000).
 
-pid(Key) ->
-    gen_server:call(?MODULE, {get_pid, Key}).
+
 
 %% @doc: Replaces the primary and replica node list on all nodes in
 %% the cluster. Assumes no failures.
@@ -171,6 +184,7 @@ get_debug_state() ->
 %%%===================================================================
 
 init([W]) ->
+    ?DB = ets:new(?DB, [named_table, protected]), %, {read_concurrency, true}])
     {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
     {ok, WriteLocksExpireRef} = timer:send_interval(1000, expire_locks),
     {ok, #state{w = W,
@@ -199,11 +213,11 @@ handle_call({get_write_lock, Key, Value, Tag}, _From,
         false ->
             %% Only grant the lock if the current value is what the
             %% coordinator expects
-            case dict:find(Key, State#state.db) of
-                {ok, {DbValue, _}} when DbValue =:= Value ->
+            case ets:lookup(?DB, Key) of
+                [{Key, DbValue, _Expire}] when DbValue =:= Value ->
                     NewLocks = [{Tag, Key, Value, now_to_ms()} | Locks],
                     {reply, ok, State#state{locks = NewLocks}};
-                error when Value =:= not_found->
+                [] when Value =:= not_found->
                     NewLocks = [{Tag, Key, Value, now_to_ms()} | Locks],
                     {reply, ok, State#state{locks = NewLocks}};
                 _Other ->
@@ -225,15 +239,15 @@ handle_call({release_write_lock, Tag}, _From, #state{locks = Locks} = State) ->
 %%
 
 handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
-            #state{locks = Locks, db = Db} = State) ->
+            #state{locks = Locks} = State) ->
     %% Database write. LockTag might be a valid write-lock, in which
     %% case it is deleted to avoid the extra round-trip of explicit
     %% delete. If it is not valid, we assume the coordinator had a
     %% quorum before writing.
 
     NewLocks = lists:keydelete(LockTag, 1, Locks),
-    NewDb = dict:store(Key, {Value, now_to_ms() + LeaseLength}, Db),
-    {reply, ok, State#state{locks = NewLocks, db = NewDb}};
+    true = ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength}),
+    {reply, ok, State#state{locks = NewLocks}};
 
 
 %%
@@ -241,26 +255,25 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
 %%
 
 handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
-            #state{locks = Locks, db = Db} = State) ->
+            #state{locks = Locks} = State) ->
     %% Extending a lease sets a new expire time. As the coordinator
     %% holds a write lock on the key, it is not necessary to perform
     %% any validation.
 
-    case dict:find(Key, State#state.db) of
-        {ok, {Value, _}} ->
+    case ets:lookup(?DB, Key) of
+        [{Key, Value, _}] ->
             NewLocks = lists:keydelete(LockTag, 1, Locks),
-            NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength}, Db),
-            {reply, ok, State#state{locks = NewLocks, db = NewDb}};
+            true = ets:insert(?DB, {Key, Value, now_to_ms() + ExtendLength}),
+            {reply, ok, State#state{locks = NewLocks}};
 
-        {ok, _OtherValue} ->
+        [{Key, _OtherValue, _}] ->
             {reply, {error, not_owner}, State};
-        error ->
+        [] ->
             %% Not found, so create it if we are a replica
             case ordsets:is_element(node(), State#state.replicas) of
                 true ->
-                    NewDb = dict:store(Key, {Value, now_to_ms() + ExtendLength},
-                                       Db),
-                    {reply, ok, State#state{db = NewDb}};
+                    true = ets:insert(?DB, {Key, Value, now_to_ms() + ExtendLength}),
+                    {reply, ok, State};
                 false ->
                     {reply, {error, not_found}, State}
             end
@@ -268,12 +281,12 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
 
 
 handle_call({release, Key, Value, LockTag}, _From,
-            #state{locks = Locks, db = Db} = State) ->
-    case dict:find(Key, State#state.db) of
-        {ok, {Value, _}} ->
+            #state{locks = Locks} = State) ->
+    case ets:lookup(?DB, Key) of
+        [{Key, Value, _Lease}] ->
             NewLocks = lists:keydelete(LockTag, 1, Locks),
-            NewDb = dict:erase(Key, Db),
-            {reply, ok, State#state{locks = NewLocks, db = NewDb}};
+            true = ets:delete(?DB, Key),
+            {reply, ok, State#state{locks = NewLocks}};
 
         {ok, {_OtherPid, _}} ->
             {reply, {error, not_owner}, State};
@@ -297,15 +310,6 @@ handle_call(get_nodes, _From, State) ->
 handle_call({set_w, W}, _From, State) ->
     {reply, ok, State#state{w = W}};
 
-handle_call({get_pid, Key}, _From, State) ->
-    Reply = case dict:find(Key, State#state.db) of
-                {ok, {Pid, _}} ->
-                    {ok, Pid};
-                error ->
-                    {error, not_found}
-            end,
-    {reply, Reply, State};
-
 handle_call({set_nodes, Primaries, Replicas}, _From, State) ->
     {reply, ok, State#state{nodes = ordsets:from_list(Primaries),
                             replicas = ordsets:from_list(Replicas)}};
@@ -321,7 +325,7 @@ handle_call({remove_node, Node, Reverse}, _From,
 
 handle_call(get_debug_state, _From, State) ->
     {reply, {ok, State#state.locks,
-             dict:to_list(State#state.db),
+             ets:tab2list(?DB),
              State#state.lease_expire_ref,
              State#state.write_locks_expire_ref}, State}.
 
@@ -330,24 +334,29 @@ handle_call(get_debug_state, _From, State) ->
 handle_cast(_, State) ->
     {stop, badmsg, State}.
 
-handle_info(expire_leases, #state{db = Db} = State) ->
+handle_info(expire_leases, State) ->
+    %% Run through each element in the ETS-table checking for expired
+    %% keys so we can at the same time check if the key is locked. If
+    %% we would use select_delet/2, we could not check for locks and
+    %% we would still have to scan the entire table.
+    %%
+    %% If expiration of many keys becomes too expensive, we could keep
+    %% a priority queue mapping expire to key.
+
     Now = now_to_ms(),
-    Expired = dict:fold(
-                fun(Key, {_Pid, ExpireTime}, Acc) ->
-                        case is_expired(ExpireTime, Now) andalso
-                            not is_locked(Key, State#state.locks) of
-                            true ->
-                                [Key | Acc];
-                            false ->
-                                Acc
-                        end
-                end, [], Db),
+    ExpiredKeys = lists:foldl(
+                    fun ({Key, _Value, ExpireTime}, Acc) ->
+                            case is_expired(ExpireTime, Now)
+                                andalso not is_locked(Key, State#state.locks) of
+                                true ->
+                                    [Key | Acc];
+                                false ->
+                                    Acc
+                            end
+                    end, [], ets:tab2list(?DB)),
 
-    NewDb = lists:foldl(fun (Key, D) ->
-                                dict:erase(Key, D)
-                        end, Db, Expired),
-
-    {noreply, State#state{db = NewDb}};
+    lists:foreach(fun (Key) -> ets:delete(?DB, Key) end, ExpiredKeys),
+    {noreply, State};
 
 
 handle_info(expire_locks, #state{locks = Locks} = State) ->

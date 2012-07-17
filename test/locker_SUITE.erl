@@ -55,13 +55,13 @@ quorum(_) ->
     receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
     receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
 
-    ?line {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    ?line {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    ?line {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    ?line {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    ?line {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    ?line {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _} = rpc:call(C, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -80,9 +80,9 @@ no_quorum_possible(_) ->
     {error, no_quorum} = receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
     {error, no_quorum} = receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
 
-    {error, not_found} = rpc:call(A, locker, pid, [123]),
-    {error, not_found} = rpc:call(B, locker, pid, [123]),
-    {error, not_found} = rpc:call(C, locker, pid, [123]),
+    {error, not_found} = rpc:call(A, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
     {ok, [], [], _, _} = rpc:call(A, locker, get_debug_state, []),
     {ok, [], [], _, _} = rpc:call(B, locker, get_debug_state, []),
@@ -97,14 +97,14 @@ release(_) ->
     Value = self(),
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, Value]),
 
-    {ok, Value} = rpc:call(A, locker, pid, [123]),
-    {ok, Value} = rpc:call(B, locker, pid, [123]),
-    {ok, Value} = rpc:call(C, locker, pid, [123]),
+    {ok, Value} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Value} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Value} = rpc:call(C, locker, dirty_read, [123]),
     slave:stop(A),
     slave:stop(B),
 
     {error, no_quorum} = rpc:call(C, locker, release, [123, Value]),
-    {ok, Value} = rpc:call(C, locker, pid, [123]),
+    {ok, Value} = rpc:call(C, locker, dirty_read, [123]),
 
     teardown([A, B, C]).
 
@@ -119,11 +119,11 @@ one_node_down(_) ->
           end),
     receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
 
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
 
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, {Pid, _}}], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _} = rpc:call(A, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _} = rpc:call(B, locker, get_debug_state, []),
 
     teardown([A, B, C]).
 
@@ -134,21 +134,21 @@ extend_propagates(_) ->
     Pid = self(),
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
 
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {error, not_found} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
-    {ok, [], [{123, {Pid, _}}], _, _} = state(A),
-    {ok, [], [{123, {Pid, _}}], _, _} = state(B),
+    {ok, [], [{123, Pid, _}], _, _} = state(A),
+    {ok, [], [{123, Pid, _}], _, _} = state(B),
     {ok, [], [], _, _} = state(C),
 
     ok = rpc:call(A, locker, set_nodes, [[A, B, C], [A, B], [C]]),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
 
-    {ok, [], [{123, {Pid, ExA}}], _, _} = state(A),
-    {ok, [], [{123, {Pid, ExB}}], _, _} = state(B),
-    {ok, [], [{123, {Pid, ExC}}], _, _} = state(C),
+    {ok, [], [{123, Pid, ExA}], _, _} = state(A),
+    {ok, [], [{123, Pid, ExB}], _, _} = state(B),
+    {ok, [], [{123, Pid, ExC}], _, _} = state(C),
 
     abs((ExA - ExB)) < 3 orelse throw(too_much_drift),
     abs((ExB - ExC)) < 3 orelse throw(too_much_drift),
@@ -163,28 +163,28 @@ lease_extend(_) ->
 
     Pid = self(),
     {ok, _, _, _} = rpc:call(A, locker, lock, [123, Pid]),
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     timer:sleep(2000),
     rpc:sbcast([A, B, C], locker, expire_leases),
 
-    {error, not_found} = rpc:call(A, locker, pid, [123]),
-    {error, not_found} = rpc:call(B, locker, pid, [123]),
-    {error, not_found} = rpc:call(C, locker, pid, [123]),
+    {error, not_found} = rpc:call(A, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
     {ok, _, _, _} = rpc:call(A, locker, lock, [123, Pid]),
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
 
     ok = rpc:call(B, locker, extend_lease, [123, Pid, 2000]),
     rpc:sbcast([A, B, C], locker, expire_leases),
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     ok.
 
@@ -210,9 +210,9 @@ replica(_) ->
 
     Pid = self(),
     {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     slave:stop(B),
 
@@ -226,9 +226,9 @@ promote(_) ->
 
     Pid = self(),
     {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
-    {ok, Pid} = rpc:call(A, locker, pid, [123]),
-    {ok, Pid} = rpc:call(B, locker, pid, [123]),
-    {ok, Pid} = rpc:call(C, locker, pid, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
 
     ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B, C], []]),

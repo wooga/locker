@@ -33,6 +33,11 @@ If the majority of the nodes gives the user the promise (quorum), the
 user can go ahead and commit the lock. If a positive majority was not
 reached, the user will abort and delete any promises it received.
 
+### Reads
+
+`locker` currently only offers dirty reads from the local node. If we
+need consistent reads, a read quorum can be used.
+
 ### Node failure
 
 "So, this is all fine and good, but what happens when a node
