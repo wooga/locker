@@ -15,6 +15,8 @@
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
 -export([dirty_read/1]).
+-export([lag/0, summary/0]).
+
 
 -export([get_write_lock/4, do_write/6, release_write_lock/3]).
 -export([get_nodes/0, get_debug_state/0]).
@@ -156,6 +158,20 @@ dirty_read(Key) ->
         [] ->
             {error, not_found}
     end.
+
+%%
+%% Operations
+%%
+
+lag() ->
+    {Time, Result} = timer:tc(fun() -> lock('__lock_lag_probe', foo, 10) end),
+    {Time / 1000, Result}.
+
+summary() ->
+    {ok, WriteLocks, Leases, _LeaseExpireRef, _WriteLocksExpireRef} = get_debug_state(),
+    [{write_locks, length(WriteLocks)},
+     {leases, length(Leases)}].
+
 
 
 %%
