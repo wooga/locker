@@ -89,10 +89,11 @@ lock(Key, Value, LeaseLength, Timeout) ->
             %% Majority of nodes gave us the lock, go ahead and do the
             %% write on all nodes. The write also releases the lock
 
-            {WriteReplies, _} = do_write(Nodes ++ Replicas,
+            {WriteReplies, _} = do_write(Nodes,
                                          Tag, Key, Value,
                                          LeaseLength, Timeout),
             {OkWrites, _} = ok_responses(WriteReplies),
+            gen_server:abcast(Replicas, locker, {write, Tag, Key, Value, LeaseLength}),
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
             {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
@@ -139,8 +140,9 @@ extend_lease(Key, Value, LeaseLength, Timeout) ->
 
             Request = {extend_lease, Tag, Key, Value, LeaseLength},
             {Replies, _} =
-                gen_server:multi_call(Nodes ++ Replicas, locker, Request, Timeout),
+                gen_server:multi_call(Nodes, locker, Request, Timeout),
             {_, FailedExtended} = ok_responses(Replies),
+            gen_server:abcast(Replicas, locker, Request),
             release_write_lock(FailedExtended, Tag, Timeout),
             ok;
         _ ->
@@ -360,9 +362,37 @@ handle_call(get_debug_state, _From, State) ->
              State#state.write_locks_expire_ref}, State}.
 
 
+%%
+%% REPLICATION
+%%
 
-handle_cast(_, State) ->
-    {stop, badmsg, State}.
+handle_cast({write, _LockTag, Key, Value, LeaseLength}, State) ->
+    %% Writes to the replicas are sent asynchronously by the
+    %% client. If we are a replica, blindly accept the write.
+
+    case ordsets:is_element(node(), State#state.replicas) of
+        true ->
+            true = ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength});
+        false ->
+            noop
+    end,
+    {noreply, State};
+
+
+handle_cast({extend_lease, _LockTag, Key, Value, ExtendLength}, State) ->
+    %% Replicated extend_lease
+
+    case ordsets:is_element(node(), State#state.replicas) of
+        true ->
+            true = ets:insert(?DB, {Key, Value, now_to_ms() + ExtendLength});
+        false ->
+            noop
+    end,
+    {noreply, State};
+
+
+handle_cast(Msg, State) ->
+    {stop, {badmsg, Msg}, State}.
 
 handle_info(expire_leases, State) ->
     %% Run through each element in the ETS-table checking for expired

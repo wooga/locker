@@ -209,7 +209,7 @@ replica(_) ->
     {ok, [A, B], [C], 2} = rpc:call(C, locker, get_nodes, []),
 
     Pid = self(),
-    {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
     {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
@@ -225,7 +225,7 @@ promote(_) ->
     ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
 
     Pid = self(),
-    {ok, 2, 2, 3} = rpc:call(A, locker, lock, [123, Pid]),
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
     {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
