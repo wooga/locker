@@ -217,7 +217,9 @@ get_debug_state() ->
 %%%===================================================================
 
 init([W]) ->
-    ?DB = ets:new(?DB, [named_table, protected, {read_concurrency, true}]),
+    ?DB = ets:new(?DB, [named_table, protected,
+                        {read_concurrency, true},
+                        {write_concurrency, true}]),
     {ok, LeaseExpireRef} = timer:send_interval(500, expire_leases),
     {ok, WriteLocksExpireRef} = timer:send_interval(500, expire_locks),
     {ok, #state{w = W,
