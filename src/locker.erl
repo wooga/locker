@@ -45,9 +45,16 @@
           %% concurrent locks
           locks = [], %% {tag, key, pid, now}
 
+
+          %% The masters queue writes in the trans_log for batching to
+          %% the replicas, triggered every N milliseconds by the
+          %% push_replica timer
+          trans_log = [],
+
           %% Timer references
           lease_expire_ref,
-          write_locks_expire_ref
+          write_locks_expire_ref,
+          push_trans_log_ref
 }).
 
 -define(LEASE_LENGTH, 2000).
@@ -79,7 +86,7 @@ lock(Key, Value, LeaseLength) ->
 %% in the case of contention and C is the number of nodes who
 %% acknowledged commit of the lock successfully.
 lock(Key, Value, LeaseLength, Timeout) ->
-    {ok, Nodes, Replicas, W} = get_nodes(Timeout),
+    {ok, Nodes, _Replicas, W} = get_nodes(Timeout),
 
     %% Try getting the write lock on all nodes
     {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, not_found, Timeout),
@@ -93,7 +100,6 @@ lock(Key, Value, LeaseLength, Timeout) ->
                                          Tag, Key, Value,
                                          LeaseLength, Timeout),
             {OkWrites, _} = ok_responses(WriteReplies),
-            gen_server:abcast(Replicas, locker, {write, Tag, Key, Value, LeaseLength}),
             {ok, W, length(OkNodes), length(OkWrites)};
         _ ->
             {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
@@ -132,7 +138,7 @@ extend_lease(Key, Value, LeaseLength) ->
 %% time), to allow for nodes that just joined to set the correct
 %% expiration time without knowing the start time of the lease.
 extend_lease(Key, Value, LeaseLength, Timeout) ->
-    {ok, Nodes, Replicas, W} = get_nodes(Timeout),
+    {ok, Nodes, _Replicas, W} = get_nodes(Timeout),
     {Tag, WriteLockReplies, _} = get_write_lock(Nodes, Key, Value, Timeout),
 
     case ok_responses(WriteLockReplies) of
@@ -142,7 +148,6 @@ extend_lease(Key, Value, LeaseLength, Timeout) ->
             {Replies, _} =
                 gen_server:multi_call(Nodes, locker, Request, Timeout),
             {_, FailedExtended} = ok_responses(Replies),
-            gen_server:abcast(Replicas, locker, Request),
             release_write_lock(FailedExtended, Tag, Timeout),
             ok;
         _ ->
@@ -222,10 +227,12 @@ init([W]) ->
                         {write_concurrency, true}]),
     {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
     {ok, WriteLocksExpireRef} = timer:send_interval(1000, expire_locks),
+    {ok, PushTransLog} = timer:send_interval(100, push_trans_log),
     {ok, #state{w = W,
                 nodes = ordsets:new(),
                 lease_expire_ref = LeaseExpireRef,
-                write_locks_expire_ref = WriteLocksExpireRef}}.
+                write_locks_expire_ref = WriteLocksExpireRef,
+                push_trans_log_ref = PushTransLog}}.
 
 
 %%
@@ -274,15 +281,16 @@ handle_call({release_write_lock, Tag}, _From, #state{locks = Locks} = State) ->
 %%
 
 handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
-            #state{locks = Locks} = State) ->
+            #state{locks = Locks, trans_log = TransLog} = State) ->
     %% Database write. LockTag might be a valid write-lock, in which
     %% case it is deleted to avoid the extra round-trip of explicit
     %% delete. If it is not valid, we assume the coordinator had a
     %% quorum before writing.
 
     NewLocks = lists:keydelete(LockTag, 1, Locks),
+    NewTransLog = [{write, Key, Value, LeaseLength} | TransLog],
     true = ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength}),
-    {reply, ok, State#state{locks = NewLocks}};
+    {reply, ok, State#state{locks = NewLocks, trans_log = NewTransLog}};
 
 
 %%
@@ -290,7 +298,7 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
 %%
 
 handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
-            #state{locks = Locks} = State) ->
+            #state{locks = Locks, trans_log = TransLog} = State) ->
     %% Extending a lease sets a new expire time. As the coordinator
     %% holds a write lock on the key, it is not necessary to perform
     %% any validation.
@@ -298,8 +306,9 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
     case ets:lookup(?DB, Key) of
         [{Key, Value, _}] ->
             NewLocks = lists:keydelete(LockTag, 1, Locks),
+            NewTransLog = [{write, Key, Value, ExtendLength} | TransLog],
             true = ets:insert(?DB, {Key, Value, now_to_ms() + ExtendLength}),
-            {reply, ok, State#state{locks = NewLocks}};
+            {reply, ok, State#state{locks = NewLocks, trans_log = NewTransLog}};
 
         [{Key, _OtherValue, _}] ->
             {reply, {error, not_owner}, State};
@@ -315,12 +324,14 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
     end;
 
 
-handle_call({release, Key, Value, LockTag}, _From, #state{locks = Locks} = State) ->
+handle_call({release, Key, Value, LockTag}, _From,
+            #state{locks = Locks, trans_log = TransLog} = State) ->
     case ets:lookup(?DB, Key) of
         [{Key, Value, _Lease}] ->
             NewLocks = lists:keydelete(LockTag, 1, Locks),
+            NewTransLog = [{delete, Key} | TransLog],
             true = ets:delete(?DB, Key),
-            {reply, ok, State#state{locks = NewLocks}};
+            {reply, ok, State#state{locks = NewLocks, trans_log = NewTransLog}};
 
         [{Key, _OtherPid, _}] ->
             {reply, {error, not_owner}, State};
@@ -368,16 +379,20 @@ handle_call(get_debug_state, _From, State) ->
 %% REPLICATION
 %%
 
-handle_cast({write, _LockTag, Key, Value, LeaseLength}, State) ->
-    %% Writes to the replicas are sent asynchronously by the
-    %% client. If we are a replica, blindly accept the write.
+handle_cast({trans_log, _FromNode, TransLog}, State) ->
+    %% Replay transaction log. Every master pushes it's log to us and
+    %% for now we blindly write whatever we get. Hopefully we won't
+    %% get interleaved write and deletes for the same key.
 
-    case ordsets:is_element(node(), State#state.replicas) of
-        true ->
-            true = ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength});
-        false ->
-            noop
-    end,
+    %% In the future, we might want to offset the lease length in the
+    %% master before writing it to the log to ensure the lease length
+    %% is at least reasonably similar for all replicas.
+
+    lists:foreach(fun ({write, Key, Value, LeaseLength}) ->
+                          ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength});
+                      ({delete, Key}) ->
+                          ets:delete(?DB, Key)
+                  end, TransLog),
     {noreply, State};
 
 
@@ -425,6 +440,13 @@ handle_info(expire_locks, #state{locks = Locks} = State) ->
     Now = now_to_ms(),
     NewLocks = [L || {_, _, StartTimeMs} = L <- Locks, StartTimeMs + 1000 > Now],
     {noreply, State#state{locks = NewLocks}};
+
+handle_info(push_trans_log, #state{trans_log = TransLog} = State) ->
+    %% Push transaction log to *all* replicas. With multiple masters,
+    %% each replica will receive the same write multiple times.
+
+    gen_server:abcast(State#state.replicas, locker, {trans_log, node(), TransLog}),
+    {noreply, State#state{trans_log = TransLog}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
