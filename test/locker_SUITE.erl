@@ -1,7 +1,6 @@
 -module(locker_SUITE).
 -compile([export_all]).
 -include_lib("test_server/include/test_server.hrl").
--include_lib("eqc/include/eqc.hrl").
 
 -define (EBIN_DIR, lists:flatten(
     filename:dirname(filename:dirname(filename:absname(""))) ++
