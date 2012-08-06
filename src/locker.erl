@@ -10,7 +10,7 @@
 -author('Knut Nesheim <knutin@gmail.com>').
 
 %% API
--export([start_link/1, remove_node/1, set_w/2]).
+-export([start_link/1, start_link/4, remove_node/1, set_w/2]).
 -export([set_nodes/3]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
@@ -65,7 +65,12 @@
 %%%===================================================================
 
 start_link(W) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [W], []).
+    start_link(W, 10000, 1000, 100).
+
+start_link(W, LeaseExpireInterval, LockExpireInterval, PushTransInterval) ->
+    Args = [W, LeaseExpireInterval, LockExpireInterval, PushTransInterval],
+    gen_server:start_link({local, ?MODULE}, ?MODULE, Args, []).
+
 
 get_nodes() ->
     get_nodes(5000).
@@ -220,14 +225,13 @@ get_debug_state() ->
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
-
-init([W]) ->
+init([W, LeaseExpireInterval, LockExpireInterval, PushTransInterval]) ->
     ?DB = ets:new(?DB, [named_table, protected,
                         {read_concurrency, true},
                         {write_concurrency, true}]),
-    {ok, LeaseExpireRef} = timer:send_interval(10000, expire_leases),
-    {ok, WriteLocksExpireRef} = timer:send_interval(1000, expire_locks),
-    {ok, PushTransLog} = timer:send_interval(100, push_trans_log),
+    {ok, LeaseExpireRef} = timer:send_interval(LeaseExpireInterval, expire_leases),
+    {ok, WriteLocksExpireRef} = timer:send_interval(LockExpireInterval, expire_locks),
+    {ok, PushTransLog} = timer:send_interval(PushTransInterval, push_trans_log),
     {ok, #state{w = W,
                 nodes = ordsets:new(),
                 lease_expire_ref = LeaseExpireRef,
