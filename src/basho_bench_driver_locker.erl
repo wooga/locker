@@ -10,9 +10,8 @@ new(_Id) ->
         false ->
             net_kernel:start([a, longnames]),
             {ok, _LocalLocker} = locker:start_link(2),
-            [B, C] = setup([b, c]),
-            ok = locker:add_node(B),
-            ok = locker:add_node(C),
+            [B, C, D, E] = setup([b, c, d, e]),
+            ok = locker:set_nodes([node(), B, C, D, E], [node(), B, C], [D, E]),
             basho_bench_config:set(setup_completed, true),
             {ok, []}
     end.
@@ -36,7 +35,7 @@ setup(NodeNames) ->
 run(set, KeyGen, _ValueGen, State) ->
     Key = KeyGen(),
     case locker:lock(Key, self()) of
-        ok ->
+        {ok, _, _, _} ->
             {ok, State};
         {error, Error} ->
             error_logger:info_msg("Key: ~p~n", [Key]),
@@ -45,7 +44,7 @@ run(set, KeyGen, _ValueGen, State) ->
 
 run(get, KeyGen, _, State) ->
     Key = KeyGen(),
-    case locker:pid(Key) of
+    case locker:dirty_read(Key) of
         {ok, Pid} when Pid =:= self() ->
             {ok, State};
         {ok, _OtherPid} ->
