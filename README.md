@@ -22,21 +22,23 @@ There are three operations:
 
 ### Writes
 
-To achieve atomic updates, the write is done in two phases, voting and
+To achieve "atomic" updates, the write is done in two phases, voting and
 commiting.
 
-In the voting phase, the user calls every node and asks for a promise
-that the node can later set the key. This promise will block any other
-user from also receiving a promise for that key.
+In the voting phase, the client calls every master node and asks for a
+promise that the node can later set the key. This promise will block
+any other user from also receiving a promise for that key.
 
-If the majority of the nodes gives the user the promise (quorum), the
-user can go ahead and commit the lock. If a positive majority was not
-reached, the user will abort and delete any promises it received.
+If the majority of the master nodes gives the client the promise
+(quorum), the client can go ahead and commit the lock. If a positive
+majority was not reached, the client will abort and delete any
+promises it received.
 
 ### Reads
 
 `locker` currently only offers dirty reads from the local node. If we
 need consistent reads, a read quorum can be used.
+
 
 ### Node failure
 
@@ -67,20 +69,34 @@ When a lease is extended, it is gossiped to the other nodes in the
 cluster which will update their local copy if they don't already have
 the key. This is used to bring new nodes in sync.
 
+### Replication
+
+A `locker` cluster consists of masters and replicas. The masters
+participate in the quorum and accept writes from the clients. The
+masters implements strong consistency. Periodically the masters send
+off their transaction log to the replicas where it is replayed to
+create the same state. Replication is thus asynchronous and reads on
+the replicas might be inconsistent. Replication is done in batch to
+improve performance by reducing the number of messages each replica
+needs to handle.
+
 
 ### Adding new nodes
 
-The new node needs to be made aware of the current cluster, by calling
-`locker:add_node/1` for every other node in the cluster. This will
-also add the reverse connection. The Erlang distribution is used, so
-the cluster needs to already be connected or to connect without
-authentication.
+New nodes may first be added as replicas to sync up before being
+promoted to master. Every operation happening after the replica
+joined, will be also propagated to the replica. The time to catch up
+is then determined by how long it takes for all leases to be extended.
 
-The new node will immediately start participating in writes. It will
-return empty for keys where the lease has not yet been extended,
-eventually catching up and returning identical responses to the other
-nodes.
+New nodes might also be set directly as masters, in which case the new
+node might give negative votes in the quorum. As long as a quorum can
+be reached, the out-of-sync master will still accept writes and catch
+up as fast as a replica.
 
+Using `locker:set_nodes/3` masters and replicas can be set across the
+entire cluster in a "send-and-pray" operation. If something happens
+during this operation, the locker cluster might be in an inconsistent
+state.
 
 #### Assumptions
 
