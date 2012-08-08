@@ -24,10 +24,10 @@ api(_) ->
     [A, B, C] = Cluster = setup([a, b, c]),
     ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
 
-    {ok, Cluster, [], 2} = rpc:call(A, locker, get_nodes, []),
+    {Cluster, [], 2} = rpc:call(A, locker, get_meta, []),
 
     ok = rpc:call(A, locker, set_w, [[A], 3]),
-    {ok, Cluster, [], 3} = rpc:call(A, locker, get_nodes, []),
+    {Cluster, [], 3} = rpc:call(A, locker, get_meta, []),
     ok = rpc:call(A, locker, set_w, [[A], 2]),
 
     {ok, 2, 3, 3} = rpc:call(A, locker, lock, [123, self()]),
@@ -204,9 +204,9 @@ replica(_) ->
     [A, B, C] = Cluster = setup([a, b, c]),
     ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
 
-    {ok, [A, B], [C], 2} = rpc:call(A, locker, get_nodes, []),
-    {ok, [A, B], [C], 2} = rpc:call(B, locker, get_nodes, []),
-    {ok, [A, B], [C], 2} = rpc:call(C, locker, get_nodes, []),
+    {[A, B], [C], 2} = rpc:call(A, locker, get_meta, []),
+    {[A, B], [C], 2} = rpc:call(B, locker, get_meta, []),
+    {[A, B], [C], 2} = rpc:call(C, locker, get_meta, []),
 
     Pid = self(),
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
@@ -241,7 +241,6 @@ promote(_) ->
 
 
 setup(Name) when is_atom(Name) ->
-    error_logger:info_msg("starting ~p~n", [Name]),
     {ok, Node} = slave:start_link(list_to_atom(net_adm:localhost()), Name),
 
     true = rpc:call(Node, code, add_path, [?EBIN_DIR]),
