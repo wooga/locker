@@ -21,6 +21,7 @@
 -export([get_write_lock/4, do_write/6, release_write_lock/3]).
 -export([get_meta/0, get_meta_ets/1, get_debug_state/0]).
 
+-export([now_to_seconds/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -42,13 +43,14 @@
 -define(DB, locker_db).
 -define(LOCK_DB, locker_lock_db).
 -define(META_DB, locker_meta_db).
+-define(EXPIRE_DB, locker_expire_db).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
 start_link(W) ->
-    start_link(W, 10000, 1000, 100).
+    start_link(W, 1000, 1000, 100).
 
 start_link(W, LeaseExpireInterval, LockExpireInterval, PushTransInterval) ->
     Args = [W, LeaseExpireInterval, LockExpireInterval, PushTransInterval],
@@ -221,17 +223,20 @@ get_debug_state() ->
 %%% gen_server callbacks
 %%%===================================================================
 init([W, LeaseExpireInterval, LockExpireInterval, PushTransInterval]) ->
-    ?DB = ets:new(?DB, [named_table, protected,
+    ?DB = ets:new(?DB, [named_table, protected, set,
                         {read_concurrency, true},
                         {write_concurrency, true}]),
-    ?META_DB = ets:new(?META_DB, [named_table, protected,
+
+    ?LOCK_DB = ets:new(?LOCK_DB, [named_table, protected, set]),
+    ?EXPIRE_DB = ets:new(?EXPIRE_DB, [named_table, protected, bag]),
+
+
+    ?META_DB = ets:new(?META_DB, [named_table, protected, set,
                                   {read_concurrency, true}]),
     ets:insert(?META_DB, {w, W}),
     ets:insert(?META_DB, {nodes, []}),
     ets:insert(?META_DB, {replicas, []}),
 
-    ?LOCK_DB = ets:new(?LOCK_DB, [named_table, protected,
-                                  {read_concurrency, true}]),
 
     {ok, LeaseExpireRef} = timer:send_interval(LeaseExpireInterval, expire_leases),
     {ok, WriteLocksExpireRef} = timer:send_interval(LockExpireInterval, expire_locks),
@@ -252,7 +257,7 @@ handle_call({get_write_lock, Key, Value, Tag}, _From, State) ->
     %% if the key does not exist.
     %%
     %% Only one lock per key is allowed. Timeouts are triggered when
-    %% handling 'expire_locks'
+    %% expiring leases.
 
     case is_locked(Key) of
         true ->
@@ -261,10 +266,10 @@ handle_call({get_write_lock, Key, Value, Tag}, _From, State) ->
         false ->
             case ets:lookup(?DB, Key) of
                 [{Key, DbValue, _Expire}] when DbValue =:= Value ->
-                    true = set_lock(Tag, Key, now_to_ms()),
+                    set_lock(Tag, Key),
                     {reply, ok, State};
                 [] when Value =:= not_found->
-                    true = set_lock(Tag, Key, now_to_ms()),
+                    set_lock(Tag, Key),
                     {reply, ok, State};
                 _Other ->
                     {reply, {error, not_expected_value}, State}
@@ -287,8 +292,11 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
     %% delete. If it is not valid, we assume the coordinator had a
     %% quorum before writing.
     del_lock(LockTag),
+    ExpireAt = expire_at(LeaseLength),
+    ets:insert(?DB, {Key, Value, ExpireAt}),
+    schedule_expire(ExpireAt, Key),
+
     NewTransLog = [{write, Key, Value, LeaseLength} | TransLog],
-    true = ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength}),
     {reply, ok, State#state{trans_log = NewTransLog}};
 
 
@@ -299,30 +307,27 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
 handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
             #state{trans_log = TransLog} = State) ->
     %% Extending a lease sets a new expire time. As the coordinator
-    %% holds a write lock on the key, it is not necessary to perform
-    %% any validation.
+    %% holds a write lock on the key, it validation has already been
+    %% done
 
-    case ets:lookup(?DB, Key) of
-        [{Key, Value, _}] ->
-            del_lock(LockTag),
-            NewTransLog = [{write, Key, Value, ExtendLength} | TransLog],
-            true = ets:insert(?DB, {Key, Value, now_to_ms() + ExtendLength}),
-            {reply, ok, State#state{trans_log = NewTransLog}};
+    del_lock(LockTag),
+    ExpireAt = expire_at(ExtendLength),
+    ets:insert(?DB, {Key, Value, ExpireAt}),
+    schedule_expire(ExpireAt, Key),
 
-        [{Key, _OtherValue, _}] ->
-            {reply, {error, not_owner}, State};
-        [] ->
-            {reply, {error, not_found}, State}
-    end;
+    NewTransLog = [{write, Key, Value, ExtendLength} | TransLog],
+    {reply, ok, State#state{trans_log = NewTransLog}};
 
 
 handle_call({release, Key, Value, LockTag}, _From,
             #state{trans_log = TransLog} = State) ->
     case ets:lookup(?DB, Key) of
-        [{Key, Value, _Lease}] ->
+        [{Key, Value, ExpireAt}] ->
             del_lock(LockTag),
+            ets:delete(?DB, Key),
+            ets:delete_object(?EXPIRE_DB, {ExpireAt, Key}),
+
             NewTransLog = [{delete, Key} | TransLog],
-            true = ets:delete(?DB, Key),
             {reply, ok, State#state{trans_log = NewTransLog}};
 
         [{Key, _OtherValue, _}] ->
@@ -369,11 +374,13 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
     %% master before writing it to the log to ensure the lease length
     %% is at least reasonably similar for all replicas.
 
-    lists:foreach(fun ({write, Key, Value, LeaseLength}) ->
-                          ets:insert(?DB, {Key, Value, now_to_ms() + LeaseLength});
-                      ({delete, Key}) ->
-                          ets:delete(?DB, Key)
-                  end, TransLog),
+    lists:foreach(
+      fun ({write, Key, Value, LeaseLength}) ->
+              Object = {Key, Value, trunc(now_to_seconds() + (LeaseLength/1000))},
+              ets:insert(?DB, Object);
+          ({delete, Key}) ->
+              ets:delete(?DB, Key)
+      end, TransLog),
     {noreply, State};
 
 handle_cast(Msg, State) ->
@@ -385,33 +392,26 @@ handle_cast(Msg, State) ->
 
 
 handle_info(expire_leases, State) ->
-    %% Run through each element in the ETS-table checking for expired
-    %% keys so we can at the same time check if the key is locked. If
-    %% we would use select_delet/2, we could not check for locks and
-    %% we would still have to scan the entire table.
-    %%
-    %% If expiration of many keys becomes too expensive, we could keep
-    %% a priority queue mapping expire to key.
+    %% Delete any leases that has expired. There might be writes in
+    %% flight, but they have already been validated in the locking
+    %% phase and will be written regardless of what is in the db.
 
-    Now = now_to_ms(),
-    ExpiredKeys = lists:foldl(
-                    fun ({Key, _Value, ExpireTime}, Acc) ->
-                            case is_expired(ExpireTime, Now)
-                                andalso not is_locked(Key) of
-                                true ->
-                                    [Key | Acc];
-                                false ->
-                                    Acc
-                            end
-                    end, [], ets:tab2list(?DB)),
-
-    lists:foreach(fun (Key) -> ets:delete(?DB, Key) end, ExpiredKeys),
+    Now = now_to_seconds(),
+    Expired = ets:lookup(?EXPIRE_DB, Now),
+    lists:foreach(fun ({_, Key} = Object) ->
+                          ets:delete_object(?EXPIRE_DB, Object),
+                          ets:delete(?DB, Key)
+                  end, Expired),
     {noreply, State};
 
-
 handle_info(expire_locks, State) ->
-    %% Now = now_to_ms(),
-    %% NewLocks = [L || {_, _, StartTimeMs} = L <- Locks, StartTimeMs + 1000 > Now],
+    %% Make a table scan of the write locks. There should be very few
+    %% (<1000) writes in progress at any time, so a full scan is
+    %% ok. Optimize like the leases if needed.
+    Now = now_to_seconds(),
+    ets:select_delete(?LOCK_DB,
+                      [{ {'_', '_', '$1'}, [{'<', '$1', Now}], [true] }]),
+
     {noreply, State};
 
 handle_info(push_trans_log, #state{trans_log = TransLog} = State) ->
@@ -434,28 +434,40 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 now_to_ms() ->
-    now_to_ms(now()).
+    now_to_ms(os:timestamp()).
 
 now_to_ms({MegaSecs,Secs,MicroSecs}) ->
     (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
+
+now_to_seconds() ->
+    now_to_seconds(os:timestamp()).
+
+now_to_seconds(Now) ->
+    {MegaSeconds, Seconds, _} = Now,
+    MegaSeconds * 1000000 + Seconds.
+
+ok_responses(Replies) ->
+    lists:partition(fun ({_, ok}) -> true;
+                        (_)       -> false
+                    end, Replies).
+
+schedule_expire(At, Key) ->
+    true = ets:insert(?EXPIRE_DB, {At, Key}),
+    ok.
+
+expire_at(Length) ->
+    trunc(now_to_seconds() + (Length/1000)).
+
 
 %%
 %% WRITE-LOCKS
 %%
 
 is_locked(Key) ->
-    ets:match(?LOCK_DB, {{'_', Key}, '_'}) =/= [].
+    ets:match(?LOCK_DB, {Key, '_', '_'}) =/= [].
 
-set_lock(Tag, Key, Timestamp) ->
-    ets:insert_new(?LOCK_DB, {{Tag, Key}, Timestamp}).
+set_lock(Tag, Key) ->
+    ets:insert_new(?LOCK_DB, {Key, Tag, now_to_seconds() + 10}).
 
 del_lock(Tag) ->
-    ets:match_delete(?LOCK_DB, {{Tag, '_'}, '_'}).
-
-is_expired(ExpireTime, NowMs)->
-    ExpireTime < NowMs.
-
-ok_responses(Replies) ->
-    lists:partition(fun ({_, ok}) -> true;
-                        (_)       -> false
-                    end, Replies).
+    ets:match_delete(?LOCK_DB, {'_', Tag, '_'}).
