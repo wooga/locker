@@ -14,7 +14,7 @@
 -export([set_w/2, set_nodes/3]).
 
 -export([lock/2, lock/3, extend_lease/3, release/2]).
--export([dirty_read/1]).
+-export([dirty_read/1, master_dirty_read/1]).
 -export([lag/0, summary/0]).
 
 
@@ -153,6 +153,12 @@ dirty_read(Key) ->
         [] ->
             {error, not_found}
     end.
+
+%% @doc: Execute a dirty read on the master. Same caveats as for
+%% dirty_read/1
+master_dirty_read(Key) ->
+    [Master | _Masters] = get_meta_ets(nodes),
+    rpc:call(Master, locker, dirty_read, [Key]).
 
 %%
 %% Helpers for operators
