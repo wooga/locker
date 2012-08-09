@@ -389,7 +389,11 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
               schedule_expire(ExpireAt, Key),
               ets:insert(?DB, {Key, Value, ExpireAt});
           ({delete, Key}) ->
-              delete_expire(expires(Key), Key),
+              case expires(Key) of
+                  [] -> ok;
+                  ExpireAt ->
+                      delete_expire(ExpireAt, Key)
+              end,
               ets:delete(?DB, Key)
       end, TransLog),
     {noreply, State};
@@ -475,7 +479,9 @@ expire_at(Length) ->
 expires(Key) ->
     case ets:lookup(?DB, Key) of
         [{Key, _Value, ExpireAt}] ->
-            ExpireAt
+            ExpireAt;
+        [] ->
+            []
     end.
 
 
