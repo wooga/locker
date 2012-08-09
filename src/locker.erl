@@ -312,11 +312,13 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
     %% done
 
     del_lock(LockTag),
+    delete_expire(expires(Key), Key),
+
     ExpireAt = expire_at(ExtendLength),
     ets:insert(?DB, {Key, Value, ExpireAt}),
     schedule_expire(ExpireAt, Key),
 
-    NewTransLog = [{write, Key, Value, ExtendLength} | TransLog],
+    NewTransLog = [{extend_lease, Key, Value, ExtendLength} | TransLog],
     {reply, ok, State#state{trans_log = NewTransLog}};
 
 
@@ -326,7 +328,7 @@ handle_call({release, Key, Value, LockTag}, _From,
         [{Key, Value, ExpireAt}] ->
             del_lock(LockTag),
             ets:delete(?DB, Key),
-            ets:delete_object(?EXPIRE_DB, {ExpireAt, Key}),
+            delete_expire(ExpireAt, Key),
 
             NewTransLog = [{delete, Key} | TransLog],
             {reply, ok, State#state{trans_log = NewTransLog}};
@@ -377,9 +379,17 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
 
     lists:foreach(
       fun ({write, Key, Value, LeaseLength}) ->
-              Object = {Key, Value, trunc(now_to_seconds() + (LeaseLength/1000))},
-              ets:insert(?DB, Object);
+              ExpireAt = expire_at(LeaseLength),
+              schedule_expire(ExpireAt, Key),
+              ets:insert(?DB, {Key, Value, ExpireAt});
+          ({extend_lease, Key, Value, LeaseLength}) ->
+              delete_expire(expires(Key), Key),
+
+              ExpireAt = expire_at(LeaseLength),
+              schedule_expire(ExpireAt, Key),
+              ets:insert(?DB, {Key, Value, ExpireAt});
           ({delete, Key}) ->
+              delete_expire(expires(Key), Key),
               ets:delete(?DB, Key)
       end, TransLog),
     {noreply, State};
@@ -399,8 +409,8 @@ handle_info(expire_leases, State) ->
 
     Now = now_to_seconds(),
     Expired = ets:lookup(?EXPIRE_DB, Now),
-    lists:foreach(fun ({_, Key} = Object) ->
-                          ets:delete_object(?EXPIRE_DB, Object),
+    lists:foreach(fun ({At, Key}) ->
+                          delete_expire(At, Key),
                           ets:delete(?DB, Key)
                   end, Expired),
     {noreply, State};
@@ -418,8 +428,9 @@ handle_info(expire_locks, State) ->
 handle_info(push_trans_log, #state{trans_log = TransLog} = State) ->
     %% Push transaction log to *all* replicas. With multiple masters,
     %% each replica will receive the same write multiple times.
-    gen_server:abcast(get_meta_ets(replicas), locker, {trans_log, node(), TransLog}),
-    {noreply, State#state{trans_log = TransLog}};
+    Msg = {trans_log, node(), lists:reverse(TransLog)},
+    gen_server:abcast(get_meta_ets(replicas), locker, Msg),
+    {noreply, State#state{trans_log = []}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -434,12 +445,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-now_to_ms() ->
-    now_to_ms(os:timestamp()).
-
-now_to_ms({MegaSecs,Secs,MicroSecs}) ->
-    (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
-
 now_to_seconds() ->
     now_to_seconds(os:timestamp()).
 
@@ -452,12 +457,26 @@ ok_responses(Replies) ->
                         (_)       -> false
                     end, Replies).
 
+%%
+%% EXPIRATION
+%%
+
 schedule_expire(At, Key) ->
     true = ets:insert(?EXPIRE_DB, {At, Key}),
     ok.
 
+delete_expire(At, Key) ->
+    ets:delete_object(?EXPIRE_DB, {At, Key}),
+    ok.
+
 expire_at(Length) ->
     trunc(now_to_seconds() + (Length/1000)).
+
+expires(Key) ->
+    case ets:lookup(?DB, Key) of
+        [{Key, _Value, ExpireAt}] ->
+            ExpireAt
+    end.
 
 
 %%
