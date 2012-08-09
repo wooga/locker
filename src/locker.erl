@@ -159,10 +159,11 @@ dirty_read(Key) ->
 %%
 
 lag() ->
+    Key = {'__lock_lag_probe', os:timestamp()},
     {Time, Result} = timer:tc(fun() ->
-                                      lock({'__lock_lag_probe', os:timestamp()},
-                                           foo, 10)
+                                      lock(Key, foo, 10)
                               end),
+    release(Key, foo),
     {Time / 1000, Result}.
 
 summary() ->
