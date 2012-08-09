@@ -336,7 +336,7 @@ handle_call({release, Key, Value, LockTag}, _From,
             ets:delete(?DB, Key),
             delete_expire(ExpireAt, Key),
 
-            NewTransLog = [{delete, Key} | TransLog],
+            NewTransLog = [{release, Key} | TransLog],
             {reply, ok, State#state{trans_log = NewTransLog}};
 
         [{Key, _OtherValue, _}] ->
@@ -386,21 +386,24 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
     lists:foreach(
       fun ({write, Key, Value, LeaseLength}) ->
               ExpireAt = expire_at(LeaseLength),
-              schedule_expire(ExpireAt, Key),
-              ets:insert(?DB, {Key, Value, ExpireAt});
-          ({extend_lease, Key, Value, LeaseLength}) ->
+              ets:insert(?DB, {Key, Value, ExpireAt}),
+              schedule_expire(ExpireAt, Key);
+          ({extend_lease, Key, Value, ExtendLength}) ->
               delete_expire(expires(Key), Key),
 
-              ExpireAt = expire_at(LeaseLength),
-              schedule_expire(ExpireAt, Key),
-              ets:insert(?DB, {Key, Value, ExpireAt});
-          ({delete, Key}) ->
-              case expires(Key) of
-                  [] -> ok;
-                  ExpireAt ->
-                      delete_expire(ExpireAt, Key)
-              end,
-              ets:delete(?DB, Key)
+              ExpireAt = expire_at(ExtendLength),
+              ets:insert(?DB, {Key, Value, ExpireAt}),
+              schedule_expire(ExpireAt, Key);
+          ({release, Key}) ->
+              %% Due to replication lag, the key might already have
+              %% been expired
+              case ets:lookup(?DB, Key) of
+                  [{Key, _Value, ExpireAt}] ->
+                      delete_expire(ExpireAt, Key),
+                      ets:delete(?DB, Key);
+                  [] ->
+                      ok
+              end
       end, TransLog),
     {noreply, State};
 
