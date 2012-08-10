@@ -375,9 +375,9 @@ handle_call(get_debug_state, _From, State) ->
 %%
 
 handle_cast({trans_log, _FromNode, TransLog}, State) ->
-    %% Replay transaction log. Every master pushes it's log to us and
-    %% for now we blindly write whatever we get. Hopefully we won't
-    %% get interleaved write and deletes for the same key.
+    %% Replay transaction log.
+
+
 
     %% In the future, we might want to offset the lease length in the
     %% master before writing it to the log to ensure the lease length
@@ -385,18 +385,26 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
 
     lists:foreach(
       fun ({write, Key, Value, LeaseLength}) ->
+              %% With multiple masters, we will get multiple writes
+              %% for the same key. The last write will win for the
+              %% lease db, but make sure we only have one entry in the
+              %% expire table.
+              delete_expire(expires(Key), Key),
+
               ExpireAt = expire_at(LeaseLength),
               ets:insert(?DB, {Key, Value, ExpireAt}),
               schedule_expire(ExpireAt, Key);
+
           ({extend_lease, Key, Value, ExtendLength}) ->
               delete_expire(expires(Key), Key),
 
               ExpireAt = expire_at(ExtendLength),
               ets:insert(?DB, {Key, Value, ExpireAt}),
               schedule_expire(ExpireAt, Key);
+
           ({release, Key}) ->
               %% Due to replication lag, the key might already have
-              %% been expired
+              %% been expired in which case we simply do nothing
               case ets:lookup(?DB, Key) of
                   [{Key, _Value, ExpireAt}] ->
                       delete_expire(ExpireAt, Key),
