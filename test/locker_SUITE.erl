@@ -17,7 +17,8 @@ all() ->
      extend_propagates,
      add_remove_node,
      replica,
-     promote
+     promote,
+     wait_for
     ].
 
 api(_) ->
@@ -238,6 +239,23 @@ promote(_) ->
     {ok, 2, 3, 3} = rpc:call(A, locker, release, [123, Pid]),
 
     teardown([A, B, C]).
+
+
+wait_for(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
+
+    Pid = self(),
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
+
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, wait_for, [123, 5000]),
+
+    teardown([A, B, C]).
+
+%%
+%% HELPERS
+%%
 
 
 setup(Name) when is_atom(Name) ->

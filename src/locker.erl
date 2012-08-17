@@ -13,7 +13,7 @@
 -export([start_link/1, start_link/4]).
 -export([set_w/2, set_nodes/3]).
 
--export([lock/2, lock/3, extend_lease/3, release/2]).
+-export([lock/2, lock/3, extend_lease/3, release/2, wait_for/2]).
 -export([dirty_read/1, master_dirty_read/1]).
 -export([lag/0, summary/0]).
 
@@ -32,6 +32,9 @@
           %% the replicas, triggered every N milliseconds by the
           %% push_replica timer
           trans_log = [],
+
+          %% Clients can wait for a key to become available
+          waiters = [],
 
           %% Timer references
           lease_expire_ref,
@@ -89,6 +92,18 @@ lock(Key, Value, LeaseLength, Timeout) ->
         _ ->
             {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
             {error, no_quorum}
+    end.
+
+%% @doc: Waits for the key to become available on the local node. If a
+%% value is already available, returns immediately, otherwise it will
+%% return within the timeout. In case of timeout, the caller might get
+%% a reply anyway if it sent at the same time as the timeout.
+wait_for(Key, Timeout) ->
+    case dirty_read(Key) of
+        {ok, Value} ->
+            {ok, Value};
+        {error, not_found} ->
+            gen_server:call(locker, {wait_for, Key, Timeout}, Timeout)
     end.
 
 release(Key, Value) ->
@@ -346,6 +361,16 @@ handle_call({release, Key, Value, LockTag}, _From,
     end;
 
 
+%%
+%% WAIT-FOR
+%%
+
+handle_call({wait_for, Key, Timeout}, From, #state{waiters = Waiters} = State) ->
+    %% 'From' waits for the given key to become available, using
+    %% gen_server:call/3. We will reply when replaying the transaction
+    %% log. If we do not have a response within the given timeout, the
+    %% reply is discarded.
+    {noreply, State#state{waiters = [{Key, From, now_to_ms() + Timeout} | Waiters]}};
 
 
 %%
@@ -374,35 +399,53 @@ handle_call(get_debug_state, _From, State) ->
 %% REPLICATION
 %%
 
-handle_cast({trans_log, _FromNode, TransLog}, State) ->
+handle_cast({trans_log, _FromNode, TransLog}, State0) ->
     %% Replay transaction log.
-
-
 
     %% In the future, we might want to offset the lease length in the
     %% master before writing it to the log to ensure the lease length
     %% is at least reasonably similar for all replicas.
 
-    lists:foreach(
-      fun ({write, Key, Value, LeaseLength}) ->
-              %% With multiple masters, we will get multiple writes
-              %% for the same key. The last write will win for the
-              %% lease db, but make sure we only have one entry in the
-              %% expire table.
-              delete_expire(expires(Key), Key),
+    Now = now_to_ms(),
+    NotifyFun =
+        fun (Key, Value, AllWaiters) ->
+                {Waiters, NewWaiters} =
+                    lists:partition(fun ({K, _, _}) when Key =:= K -> true;
+                                        (_)           -> false
+                                    end, AllWaiters),
+                lists:foreach(fun ({_, From, Expire}) when Expire > Now ->
+                                      gen_server:reply(From, {ok, Value});
+                                  (_) ->
+                                      ok
+                              end, Waiters),
+                NewWaiters
+        end,
 
-              ExpireAt = expire_at(LeaseLength),
-              ets:insert(?DB, {Key, Value, ExpireAt}),
-              schedule_expire(ExpireAt, Key);
+    ReplayF =
+        fun ({write, Key, Value, LeaseLength}, State) ->
+                %% With multiple masters, we will get multiple writes
+                %% for the same key. The last write will win for the
+                %% lease db, but make sure we only have one entry in the
+                %% expire table.
+                delete_expire(expires(Key), Key),
 
-          ({extend_lease, Key, Value, ExtendLength}) ->
-              delete_expire(expires(Key), Key),
+                ExpireAt = expire_at(LeaseLength),
+                ets:insert(?DB, {Key, Value, ExpireAt}),
+                schedule_expire(ExpireAt, Key),
 
-              ExpireAt = expire_at(ExtendLength),
-              ets:insert(?DB, {Key, Value, ExpireAt}),
-              schedule_expire(ExpireAt, Key);
+                NewWaiters = NotifyFun(Key, Value, State#state.waiters),
+                State#state{waiters = NewWaiters};
 
-          ({release, Key}) ->
+            ({extend_lease, Key, Value, ExtendLength}, State) ->
+                delete_expire(expires(Key), Key),
+
+                ExpireAt = expire_at(ExtendLength),
+                ets:insert(?DB, {Key, Value, ExpireAt}),
+                schedule_expire(ExpireAt, Key),
+
+                State;
+
+          ({release, Key}, State) ->
               %% Due to replication lag, the key might already have
               %% been expired in which case we simply do nothing
               case ets:lookup(?DB, Key) of
@@ -411,9 +454,13 @@ handle_cast({trans_log, _FromNode, TransLog}, State) ->
                       ets:delete(?DB, Key);
                   [] ->
                       ok
-              end
-      end, TransLog),
-    {noreply, State};
+              end,
+                State
+        end,
+
+    NewState = lists:foldl(ReplayF, State0, TransLog),
+
+    {noreply, NewState};
 
 handle_cast(Msg, State) ->
     {stop, {badmsg, Msg}, State}.
@@ -473,10 +520,17 @@ now_to_seconds(Now) ->
     {MegaSeconds, Seconds, _} = Now,
     MegaSeconds * 1000000 + Seconds.
 
+now_to_ms() ->
+    now_to_ms(os:timestamp()).
+
+now_to_ms({MegaSecs,Secs,MicroSecs}) ->
+    (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
+
 ok_responses(Replies) ->
     lists:partition(fun ({_, ok}) -> true;
                         (_)       -> false
                     end, Replies).
+
 
 %%
 %% EXPIRATION
