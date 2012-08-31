@@ -1,7 +1,7 @@
 ## locker
 
-The goal of `locker` is to provide an atomic distributed "check and set"
-operation for short-lived locks.
+The goal of `locker` is to provide an atomic distributed "check and
+set" operation for short-lived locks.
 
 `locker` is a distributed de-centralized consistent in-memory
 key-value store written in Erlang. An entry expires after a certain
@@ -9,9 +9,11 @@ amount of time, unless the lease is extended. This makes it a good
 practical option for locks, mutexes and leader election in a
 distributed system.
 
-In terms of the CAP theorem, `locker` by default chooses consistency
-by requiring a quorum for every write. Leases expiring during a
-netsplit, can cause reads to to be inconsistent.
+In terms of the CAP theorem, `locker` chooses consistency by requiring
+a quorum for every write. For reads, `locker` chooses availability and
+always does a local readwhich can be inconsistent. Extensions of the
+lease is used as an anti-entropy mechanism to eventually propagate all
+leases.
 
 There are three operations:
 
@@ -40,14 +42,14 @@ promises it received.
 need consistent reads, a read quorum can be used.
 
 
-### Node failure
+### Failure
 
-"So, this is all fine and good, but what happens when a node
-fails?". To make the system simple to implement, there is a timeout on
+"So, this is all fine and good, but what happens when something
+fails?". To make the implementation simple, there is a timeout on
 every promise and every lock. If a promise is not converted into a
 lock in time, it is simply deleted.
 
-If the user process fails to extend the lease of it's lock, the lock
+If the user process fails to extend the lease of its lock, the lock
 expires without consulting any other node. If a node is partitioned
 away from the rest of the cluster, the lock might expire too soon
 resulting in reads returning the empty value. However, a new lock
@@ -65,7 +67,7 @@ expiration to `now() + lease_length`, which means that the user needs
 to account for the skew when extending the lease. With leases in the
 order of minutes, the skew should be very small.
 
-When a lease is extended, it is gossiped to the other nodes in the
+When a lease is extended, it is replicated to the other nodes in the
 cluster which will update their local copy if they don't already have
 the key. This is used to bring new nodes in sync.
 
@@ -78,7 +80,9 @@ off their transaction log to the replicas where it is replayed to
 create the same state. Replication is thus asynchronous and reads on
 the replicas might be inconsistent. Replication is done in batch to
 improve performance by reducing the number of messages each replica
-needs to handle.
+needs to handle. Calling `locker:wait_for/2` after a succesful write
+will block until the key is replicated to the local node. If the local
+node is a master, it will return immediately.
 
 
 ### Adding new nodes
@@ -97,7 +101,3 @@ Using `locker:set_nodes/3` masters and replicas can be set across the
 entire cluster in a "send-and-pray" operation. If something happens
 during this operation, the locker cluster might be in an inconsistent
 state.
-
-#### Assumptions
-
- * Two or more datacenters, latency at minimum 5ms between nodes
