@@ -57,6 +57,7 @@ quorum(_) ->
 
     ?line {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     ?line {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     ?line {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     {ok, [], [{123, Pid, _}], _, _, _} = state(A),
@@ -82,6 +83,7 @@ no_quorum_possible(_) ->
 
     {error, not_found} = rpc:call(A, locker, dirty_read, [123]),
     {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
     {ok, [], [], _, _, _} = state(A),
@@ -99,11 +101,13 @@ release(_) ->
 
     {ok, Value} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Value} = rpc:call(B, locker, dirty_read, [123]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Value} = rpc:call(C, locker, dirty_read, [123]),
     slave:stop(A),
     slave:stop(B),
 
     {error, no_quorum} = rpc:call(C, locker, release, [123, Value]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Value} = rpc:call(C, locker, dirty_read, [123]),
 
     teardown([A, B, C]).
@@ -140,15 +144,17 @@ extend_propagates(_) ->
 
     {ok, [], [{123, Pid, _}], _, _, _} = state(A),
     {ok, [], [{123, Pid, _}], _, _, _} = state(B),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, [], [], _, _, _} = state(C),
 
     ok = rpc:call(A, locker, set_nodes, [[A, B, C], [A, B], [C]]),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
-    timer:sleep(200),
+
 
     {ok, [], [{123, Pid, ExA}], _, _, _} = state(A),
     {ok, [], [{123, Pid, ExB}], _, _, _} = state(B),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, [], [{123, Pid, ExC}], _, _, _} = state(C),
 
     %% abs((ExA - ExB)) < 3 orelse throw(too_much_drift),
@@ -214,7 +220,8 @@ replica(_) ->
 
     {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
-    timer:sleep(200),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     slave:stop(B),
@@ -232,6 +239,7 @@ promote(_) ->
     timer:sleep(200),
     {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
 
@@ -249,6 +257,9 @@ wait_for(_) ->
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid]),
 
     {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
+    {badrpc, {'EXIT', {timeout, _}}} = rpc:call(C, locker, wait_for, [123, 100]),
+
+    rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Pid} = rpc:call(C, locker, wait_for, [123, 5000]),
 
     teardown([A, B, C]).
@@ -264,9 +275,10 @@ setup(Name) when is_atom(Name) ->
     true = rpc:call(Node, code, add_path, [?EBIN_DIR]),
     {ok, _} = rpc:call(Node, locker, start_link, [2]),
 
-    {ok, _, _, R1, R2, _R3} = rpc:call(Node, locker, get_debug_state, []),
+    {ok, _, _, R1, R2, R3} = rpc:call(Node, locker, get_debug_state, []),
     {ok, cancel} = rpc:call(Node, timer, cancel, [R1]),
     {ok, cancel} = rpc:call(Node, timer, cancel, [R2]),
+    {ok, cancel} = rpc:call(Node, timer, cancel, [R3]),
     Node;
 
 setup(NodeNames) ->
