@@ -5,19 +5,21 @@
 
 -record(state, {leases}).
 
-
+test() ->
+    proper:quickcheck(prop_lock_release()).
 
 prop_lock_release() ->
-    ?FORALL(Commands, commands(?MODULE),
+    ?FORALL(Commands, parallel_commands(?MODULE),
             ?TRAPEXIT(
                begin
                    [A, _B, _C] = Cluster = setup([a, b, c]),
                    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
-                   {History, State, Result} = run_commands(?MODULE, Commands),
+                   {Seq, P, Result} = run_parallel_commands(?MODULE, Commands),
                    teardown(Cluster),
-                   ?WHENFAIL(io:format("History: ~w\nState: ~w\nResult: ~w\n",
-                                       [History,State,Result]),
-                             aggregate(command_names(Commands), Result =:= ok))
+                   ?WHENFAIL(
+                      io:format("Sequential: ~p\nParallel: ~p\nRes: ~p\n",
+                                [Seq, P, Result]),
+                      Result =:= ok)
                end)).
 
 
@@ -27,30 +29,33 @@ key() ->
 value() ->
     elements([foo, bar]).
 
-
+get_node() ->
+    elements(['a@knutin', 'b@knutin']).
 
 command(S) ->
     Leases = S#state.leases =/= [],
-    oneof([{call, ?MODULE, lock, [key(), value()]}] ++
+    oneof([{call, ?MODULE, lock, [get_node(), key(), value()]}] ++
               [?LET({Key, Value}, elements(S#state.leases),
-                    {call, ?MODULE, release, [Key, Value]}) || Leases]).
+                    {call, ?MODULE, release, [get_node(), Key, Value]}) || Leases]).
 
 
-lock(Key, Value) ->
-    rpc:call('a@knutin', locker, lock, [Key, Value]).
+lock(Node, Key, Value) ->
+    rpc:call(Node, locker, lock, [Key, Value]).
 
-release(Key, Value) ->
-    rpc:call('a@knutin', locker, release, [Key, Value]).
+release(Node, Key, Value) ->
+    rpc:call(Node, locker, release, [Key, Value]).
 
 
 initial_state() ->
     #state{leases = []}.
 
+precondition(S, {call, _, release, [_, Key, _Value]}) ->
+    lists:keymember(Key, 1, S#state.leases);
 
 precondition(_, _) ->
     true.
 
-next_state(S, _V, {call, _, lock, [Key, Value]}) ->
+next_state(S, _V, {call, _, lock, [_, Key, Value]}) ->
     case lists:keymember(Key, 1, S#state.leases) of
         true ->
             S;
@@ -58,7 +63,7 @@ next_state(S, _V, {call, _, lock, [Key, Value]}) ->
             S#state{leases = [{Key, Value} | S#state.leases]}
     end;
 
-next_state(S, _V, {call, _, release, [Key, Value]}) ->
+next_state(S, _V, {call, _, release, [_, Key, Value]}) ->
     case lists:member({Key, Value}, S#state.leases) of
         true ->
             S#state{leases = lists:delete({Key, Value}, S#state.leases)};
@@ -66,7 +71,7 @@ next_state(S, _V, {call, _, release, [Key, Value]}) ->
             S
     end.
 
-postcondition(S, {call, _, lock, [Key, _Value]}, Result) ->
+postcondition(S, {call, _, lock, [_, Key, _Value]}, Result) ->
     case Result of
         {ok, _, _, _} ->
             not lists:keymember(Key, 1, S#state.leases);
@@ -75,10 +80,10 @@ postcondition(S, {call, _, lock, [Key, _Value]}, Result) ->
     end;
 
 
-postcondition(S, {call, _, release, [Key, Value]}, {ok, _, _, _}) ->
+postcondition(S, {call, _, release, [_, Key, Value]}, {ok, _, _, _}) ->
     lists:member({Key, Value}, S#state.leases);
 
-postcondition(S, {call, _, release, [Key, _Value]}, {error, no_quorum}) ->
+postcondition(S, {call, _, release, [_, Key, _Value]}, {error, no_quorum}) ->
     lists:keymember(Key, 1, S#state.leases).
 
 
