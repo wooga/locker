@@ -59,9 +59,9 @@ quorum(_) ->
     ?line {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     ?line {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
-    {ok, [], [{123, Pid, _}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, Pid, _}], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [{123, Pid, _}], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(A),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(B),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(C),
 
     teardown([A, B, C]).
 
@@ -84,9 +84,9 @@ no_quorum_possible(_) ->
     {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
     {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
-    {ok, [], [], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [], _, _} = rpc:call(B, locker, get_debug_state, []),
-    {ok, [], [], _, _} = rpc:call(C, locker, get_debug_state, []),
+    {ok, [], [], _, _, _} = state(A),
+    {ok, [], [], _, _, _} = state(B),
+    {ok, [], [], _, _, _} = state(C),
 
     teardown([A, B, C]).
 
@@ -122,8 +122,8 @@ one_node_down(_) ->
     {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
 
-    {ok, [], [{123, Pid, _}], _, _} = rpc:call(A, locker, get_debug_state, []),
-    {ok, [], [{123, Pid, _}], _, _} = rpc:call(B, locker, get_debug_state, []),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(A),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(B),
 
     teardown([A, B, C]).
 
@@ -138,18 +138,18 @@ extend_propagates(_) ->
     {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
 
-    {ok, [], [{123, Pid, _}], _, _} = state(A),
-    {ok, [], [{123, Pid, _}], _, _} = state(B),
-    {ok, [], [], _, _} = state(C),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(A),
+    {ok, [], [{123, Pid, _}], _, _, _} = state(B),
+    {ok, [], [], _, _, _} = state(C),
 
     ok = rpc:call(A, locker, set_nodes, [[A, B, C], [A, B], [C]]),
 
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
     timer:sleep(200),
 
-    {ok, [], [{123, Pid, ExA}], _, _} = state(A),
-    {ok, [], [{123, Pid, ExB}], _, _} = state(B),
-    {ok, [], [{123, Pid, ExC}], _, _} = state(C),
+    {ok, [], [{123, Pid, ExA}], _, _, _} = state(A),
+    {ok, [], [{123, Pid, ExB}], _, _, _} = state(B),
+    {ok, [], [{123, Pid, ExC}], _, _, _} = state(C),
 
     %% abs((ExA - ExB)) < 3 orelse throw(too_much_drift),
     %% abs((ExB - ExC)) < 3 orelse throw(too_much_drift),
@@ -264,7 +264,7 @@ setup(Name) when is_atom(Name) ->
     true = rpc:call(Node, code, add_path, [?EBIN_DIR]),
     {ok, _} = rpc:call(Node, locker, start_link, [2]),
 
-    {ok, _, _, R1, R2} = rpc:call(Node, locker, get_debug_state, []),
+    {ok, _, _, R1, R2, _R3} = rpc:call(Node, locker, get_debug_state, []),
     {ok, cancel} = rpc:call(Node, timer, cancel, [R1]),
     {ok, cancel} = rpc:call(Node, timer, cancel, [R2]),
     Node;

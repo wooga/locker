@@ -188,7 +188,8 @@ lag() ->
     {Time / 1000, Result}.
 
 summary() ->
-    {ok, WriteLocks, Leases, _LeaseExpireRef, _WriteLocksExpireRef} =
+    {ok, WriteLocks, Leases,
+     _LeaseExpireRef, _WriteLocksExpireRef, _PushTranslogRef} =
         get_debug_state(),
     [{write_locks, length(WriteLocks)},
      {leases, length(Leases)}].
@@ -392,7 +393,8 @@ handle_call(get_debug_state, _From, State) ->
     {reply, {ok, ets:tab2list(?LOCK_DB),
              ets:tab2list(?DB),
              State#state.lease_expire_ref,
-             State#state.write_locks_expire_ref}, State}.
+             State#state.write_locks_expire_ref,
+             State#state.push_trans_log_ref}, State}.
 
 
 %%
