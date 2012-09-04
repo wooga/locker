@@ -3,7 +3,10 @@
 
 -include_lib("proper/include/proper.hrl").
 
--record(state, {leases}).
+-record(state, {master_leases, replicated_leases}).
+
+-define(MASTERS, ['a@knutin']).
+-define(REPLICAS, ['b@knutin']).
 
 test() ->
     proper:quickcheck(prop_lock_release()).
@@ -12,8 +15,8 @@ prop_lock_release() ->
     ?FORALL(Commands, parallel_commands(?MODULE),
             ?TRAPEXIT(
                begin
-                   [A, _B, _C] = Cluster = setup([a, b, c]),
-                   ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
+                   [A, B] = Cluster = setup([a, b]),
+                   ok = rpc:call(A, locker, set_nodes, [Cluster, [A], [B]]),
                    {Seq, P, Result} = run_parallel_commands(?MODULE, Commands),
                    teardown(Cluster),
                    ?WHENFAIL(
@@ -29,14 +32,29 @@ key() ->
 value() ->
     elements([foo, bar]).
 
+get_master() ->
+    elements(?MASTERS).
+
+get_replica() ->
+    elements(?REPLICAS).
+
 get_node() ->
-    elements(['a@knutin', 'b@knutin']).
+    elements(?MASTERS ++ ?REPLICAS).
+
+is_master(N) ->
+    lists:member(N, ?MASTERS).
+
+is_replica(N) ->
+    lists:member(N, ?REPLICAS).
 
 command(S) ->
-    Leases = S#state.leases =/= [],
+    Leases = S#state.master_leases =/= [],
     oneof([{call, ?MODULE, lock, [get_node(), key(), value()]}] ++
-              [?LET({Key, Value}, elements(S#state.leases),
-                    {call, ?MODULE, release, [get_node(), Key, Value]}) || Leases]).
+              [{call, ?MODULE, read, [get_node(), key()]}] ++
+              [?LET({Key, Value}, elements(S#state.master_leases),
+                    {call, ?MODULE, release, [get_node(), Key, Value]}) || Leases] ++
+              [{call, ?MODULE, replicate, []}]
+         ).
 
 
 lock(Node, Key, Value) ->
@@ -45,46 +63,86 @@ lock(Node, Key, Value) ->
 release(Node, Key, Value) ->
     rpc:call(Node, locker, release, [Key, Value]).
 
+replicate() ->
+    rpc:sbcast(?MASTERS, locker, push_trans_log).
+
+read(Node, Key) ->
+    rpc:call(Node, locker, dirty_read, [Key]).
+
 
 initial_state() ->
-    #state{leases = []}.
+    #state{master_leases = [], replicated_leases = []}.
 
 precondition(S, {call, _, release, [_, Key, _Value]}) ->
-    lists:keymember(Key, 1, S#state.leases);
+    lists:keymember(Key, 1, S#state.master_leases);
 
 precondition(_, _) ->
     true.
 
+
 next_state(S, _V, {call, _, lock, [_, Key, Value]}) ->
-    case lists:keymember(Key, 1, S#state.leases) of
+    case lists:keymember(Key, 1, S#state.master_leases) of
         true ->
             S;
         false ->
-            S#state{leases = [{Key, Value} | S#state.leases]}
+            S#state{master_leases = [{Key, Value} | S#state.master_leases]}
     end;
 
 next_state(S, _V, {call, _, release, [_, Key, Value]}) ->
-    case lists:member({Key, Value}, S#state.leases) of
+    case lists:member({Key, Value}, S#state.master_leases) of
         true ->
-            S#state{leases = lists:delete({Key, Value}, S#state.leases)};
+            S#state{master_leases = lists:delete({Key, Value}, S#state.master_leases),
+                    replicated_leases = lists:delete({Key, Value},
+                                                     S#state.replicated_leases)};
         false ->
             S
-    end.
+    end;
+
+next_state(S, _V, {call, _, replicate, []}) ->
+    S#state{replicated_leases = S#state.master_leases};
+
+next_state(S, _V, {call, _, read, _}) ->
+    S.
+
+
 
 postcondition(S, {call, _, lock, [_, Key, _Value]}, Result) ->
     case Result of
         {ok, _, _, _} ->
-            not lists:keymember(Key, 1, S#state.leases);
+            not lists:keymember(Key, 1, S#state.master_leases);
         {error, no_quorum} ->
-            lists:keymember(Key, 1, S#state.leases)
+            lists:keymember(Key, 1, S#state.master_leases)
     end;
 
 
 postcondition(S, {call, _, release, [_, Key, Value]}, {ok, _, _, _}) ->
-    lists:member({Key, Value}, S#state.leases);
+    lists:member({Key, Value}, S#state.master_leases);
 
 postcondition(S, {call, _, release, [_, Key, _Value]}, {error, no_quorum}) ->
-    lists:keymember(Key, 1, S#state.leases).
+    lists:keymember(Key, 1, S#state.master_leases);
+
+postcondition(_S, {call, _, replicate, []}, _) ->
+    true;
+
+postcondition(S, {call, _, read, [Node, Key]}, Result) ->
+    case is_master(Node) of
+        true ->
+            case Result of
+                {ok, Value} ->
+                    lists:member({Key, Value}, S#state.master_leases);
+                {error, not_found} ->
+                    not lists:keymember(Key, 1, S#state.master_leases)
+            end;
+        false ->
+            case Result of
+                {ok, Value} ->
+                    lists:member({Key, Value}, S#state.replicated_leases);
+                {error, not_found} ->
+                    not lists:keymember(Key, 1, S#state.replicated_leases)
+            end
+    end.
+
+
 
 
 
@@ -95,7 +153,7 @@ postcondition(S, {call, _, release, [_, Key, _Value]}, {error, no_quorum}) ->
 setup(Name) when is_atom(Name) ->
     {ok, Node} = slave:start_link(list_to_atom(net_adm:localhost()), Name),
     true = rpc:call(Node, code, add_path, ["ebin"]),
-    {ok, _} = rpc:call(Node, locker, start_link, [2]),
+    {ok, _} = rpc:call(Node, locker, start_link, [1]),
 
     {ok, _, _, R1, R2, R3} = rpc:call(Node, locker, get_debug_state, []),
     {ok, cancel} = rpc:call(Node, timer, cancel, [R1]),
