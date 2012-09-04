@@ -11,15 +11,16 @@ distributed system.
 
 In terms of the CAP theorem, `locker` chooses consistency by requiring
 a quorum for every write. For reads, `locker` chooses availability and
-always does a local readwhich can be inconsistent. Extensions of the
+always does a local read which can be inconsistent. Extensions of the
 lease is used as an anti-entropy mechanism to eventually propagate all
 leases.
 
-There are three operations:
+There are four operations:
 
  * `locker:lock/2,3`
  * `locker:extend_lease/3`
  * `locker:release/2`
+ * `locker:wait_for/1`
 
 
 ### Writes
@@ -27,9 +28,10 @@ There are three operations:
 To achieve "atomic" updates, the write is done in two phases, voting and
 commiting.
 
-In the voting phase, the client calls every master node and asks for a
-promise that the node can later set the key. This promise will block
-any other user from also receiving a promise for that key.
+In the voting phase, the client asks every master node for a promise
+that the node can later set the key. The promise is only granted if
+the current value is what the client expects. The promise will block
+any other clients from also receiving a promise for that key.
 
 If the majority of the master nodes gives the client the promise
 (quorum), the client can go ahead and commit the lock. If a positive
