@@ -36,6 +36,10 @@
           %% Clients can wait for a key to become available
           waiters = [],
 
+          %% Previous point of expiration, no keys older than this
+          %% point should exist
+          prev_expire_point,
+
           %% Timer references
           lease_expire_ref,
           write_locks_expire_ref,
@@ -266,7 +270,8 @@ init([W, LeaseExpireInterval, LockExpireInterval, PushTransInterval]) ->
     {ok, PushTransLog} = timer:send_interval(PushTransInterval, push_trans_log),
     {ok, #state{lease_expire_ref = LeaseExpireRef,
                 write_locks_expire_ref = WriteLocksExpireRef,
-                push_trans_log_ref = PushTransLog}}.
+                push_trans_log_ref = PushTransLog,
+                prev_expire_point = now_to_seconds()}}.
 
 
 %%
@@ -478,12 +483,13 @@ handle_info(expire_leases, State) ->
     %% phase and will be written regardless of what is in the db.
 
     Now = now_to_seconds(),
-    Expired = ets:lookup(?EXPIRE_DB, Now),
+    Expired = lists:flatmap(fun (T) -> ets:lookup(?EXPIRE_DB, T) end,
+                            lists:seq(State#state.prev_expire_point, Now)),
     lists:foreach(fun ({At, Key}) ->
                           delete_expire(At, Key),
                           ets:delete(?DB, Key)
                   end, Expired),
-    {noreply, State};
+    {noreply, State#state{prev_expire_point = Now}};
 
 handle_info(expire_locks, State) ->
     %% Make a table scan of the write locks. There should be very few

@@ -13,6 +13,7 @@ all() ->
      no_quorum_possible,
      release,
      lease_extend,
+     expire_leases,
      one_node_down,
      extend_propagates,
      add_remove_node,
@@ -194,6 +195,35 @@ lease_extend(_) ->
     {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     ok.
+
+expire_leases(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
+
+    Pid = self(),
+    {ok, _, _, _} = rpc:call(A, locker, lock, [123, Pid]),
+
+    timer:sleep(1000),
+    {ok, _, _, _} = rpc:call(A, locker, lock, [abc, Pid]),
+
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [abc]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [abc]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [abc]),
+
+    timer:sleep(2000),
+    rpc:sbcast([A, B, C], locker, expire_leases),
+
+    {error, not_found} = rpc:call(A, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
+    {error, not_found} = rpc:call(A, locker, dirty_read, [abc]),
+    {error, not_found} = rpc:call(B, locker, dirty_read, [abc]),
+    {error, not_found} = rpc:call(C, locker, dirty_read, [abc]),
+
+    teardown([A, B, C]).
 
 add_remove_node(_) ->
     [A, B, C] = Cluster = setup([a, b, c]),
