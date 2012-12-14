@@ -4,52 +4,83 @@
          run/4]).
 
 new(_Id) ->
-    case basho_bench_config:get(setup_completed) of
+    case mark_setup_completed() of
         true ->
-            {ok, []};
-        false ->
-            net_kernel:start([a, longnames]),
+            error_logger:info_msg("setting up cluster~n"),
+            net_kernel:start([master, shortnames]),
             {ok, _LocalLocker} = locker:start_link(2),
-            [B, C, D, E] = setup([b, c, d, e]),
-            ok = locker:set_nodes([node(), B, C, D, E], [node(), B, C], [D, E]),
-            basho_bench_config:set(setup_completed, true),
-            {ok, []}
+            MasterNames = basho_bench_config:get(masters),
+            ReplicaNames = basho_bench_config:get(replicas),
+            W = basho_bench_config:get(w),
+
+            case basho_bench_config:get(start_nodes) of
+                true ->
+                    Masters = setup(MasterNames, W),
+                    Replicas = setup(ReplicaNames, W),
+
+                    ok = locker:set_nodes(Masters ++ Replicas, Masters, Replicas),
+                    error_logger:info_msg("~p~n",
+                                          [rpc:call(hd(Replicas), locker, get_meta, [])]),
+                    {ok, {Masters, Replicas}};
+                false ->
+                    {ok, []}
+            end;
+        false ->
+            %%timer:sleep(30000),
+            Masters = [list_to_atom(atom_to_list(N) ++ "@" ++ atom_to_list(H))
+                       || {H, N} <- basho_bench_config:get(masters)],
+
+            Replicas = [list_to_atom(atom_to_list(N) ++ "@" ++ atom_to_list(H))
+                        || {H, N} <- basho_bench_config:get(replicas)],
+
+            {ok, {Masters, Replicas}}
     end.
 
-setup(NodeNames) ->
-    Nodes = [element(2, slave:start(list_to_atom(net_adm:localhost()), N))
-             || N <- NodeNames],
+setup(NodeNames, W) ->
+    Nodes = [begin
+                 element(2, slave:start_link(Hostname, N))
+             end
+             || {Hostname, N} <- NodeNames],
 
     [rpc:call(N, code, add_path, ["/home/knutin/git/locker/ebin"]) || N <- Nodes],
-    [rpc:call(N, locker, start_link, [2]) || N <- Nodes],
-
-    %% [begin
-    %%      {ok, _, _, Ref} = rpc:call(N, locker, get_debug_state, []),
-    %%      error_logger:info_msg("ref: ~p~n", [Ref]),
-    %%      {ok, cancel} = rpc:call(N, timer, cancel, [Ref])
-    %%  end || N <- Nodes],
+    [rpc:call(N, locker, start_link, [W]) || N <- Nodes],
 
     Nodes.
 
 
-run(set, KeyGen, _ValueGen, State) ->
+mark_setup_completed() ->
+    case whereis(locker_setup) of
+        undefined ->
+            true = register(locker_setup, self()),
+            true;
+        _ ->
+            false
+    end.
+
+
+
+run(set, KeyGen, _ValueGen, {[M | Masters], Replicas}) ->
+    NewMasters = lists:reverse([M | lists:reverse(Masters)]),
+
     Key = KeyGen(),
-    case locker:lock(Key, self()) of
+    case rpc:call(M, locker, lock, [Key, Key]) of
         {ok, _, _, _} ->
-            {ok, State};
+            {ok, {NewMasters, Replicas}};
         {error, Error} ->
-            error_logger:info_msg("Key: ~p~n", [Key]),
-            {error, Error, State}
+            error_logger:info_msg("Key: ~p~, ~p~n", [Key, Error]),
+            {error, Error, {NewMasters, Replicas}}
     end;
 
-run(get, KeyGen, _, State) ->
+run(get, KeyGen, _, {[M | Masters], Replicas}) ->
+    NewMasters = lists:reverse([M | lists:reverse(Masters)]),
+
     Key = KeyGen(),
     case locker:dirty_read(Key) of
-        {ok, Pid} when Pid =:= self() ->
-            {ok, State};
-        {ok, _OtherPid} ->
-            {error, wrong_pid_in_read, State};
+        {ok, Key} ->
+            {ok, {NewMasters, Replicas}};
+        {ok, _OtherValue} ->
+            {error, wrong_value, {NewMasters, Replicas}};
         {error, not_found} ->
-            {ok, State}
+            {ok, {NewMasters, Replicas}}
     end.
 
