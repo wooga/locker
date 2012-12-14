@@ -1,7 +1,4 @@
-## locker
-
-The goal of `locker` is to provide an atomic distributed "check and
-set" operation for short-lived locks.
+## locker - atomic distributed "check and set" for short-lived keys
 
 `locker` is a distributed de-centralized consistent in-memory
 key-value store written in Erlang. An entry expires after a certain
