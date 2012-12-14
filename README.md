@@ -12,6 +12,10 @@ always does a local read which can be inconsistent. Extensions of the
 lease is used as an anti-entropy mechanism to eventually propagate all
 leases.
 
+It is designed to be used inside your application on the Erlang VM,
+using the Erlang distribution to communicate with masters and
+replicas.
+
 There are four operations:
 
  * `locker:lock/2,3`
