@@ -19,7 +19,8 @@ all() ->
      add_remove_node,
      replica,
      promote,
-     wait_for
+     wait_for,
+     update
     ].
 
 api(_) ->
@@ -39,6 +40,8 @@ api(_) ->
     false = rpc:call(C, erlang, is_process_alive, [Pid]),
     {ok, 2, 2, 2} = rpc:call(A, locker, release, [123, self()]),
     {ok, 2, 2, 2} = rpc:call(B, locker, lock, [123, self()]),
+    {error, no_quorum} = rpc:call(A, locker, update, [123, wrong_value,
+                                                      new_value]),
 
     teardown([A, B, C]).
 
@@ -291,6 +294,32 @@ wait_for(_) ->
 
     rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Pid} = rpc:call(C, locker, wait_for, [123, 5000]),
+
+    teardown([A, B, C]).
+
+update(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
+
+    Key = 123,
+    Value0 = 41,
+    Value1 = 42,
+    LeaseLength = 50,
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [Key, Value0, LeaseLength]),
+    {ok, 2, 2, 2} = rpc:call(B, locker, update, [Key, Value0, Value1]),
+
+    rpc:sbcast([A, B, C], locker, push_trans_log),
+    {ok, Value1} = rpc:call(C, locker, dirty_read, [Key]),
+    {ok, Value1} = rpc:call(B, locker, dirty_read, [Key]),
+
+    {error, no_quorum} = rpc:call(A, locker, update, [Key, Value0,
+                                                      random_value]),
+
+    timer:sleep(LeaseLength),
+    rpc:sbcast([A, B, C], locker, expire_leases),
+
+    Res = lists:duplicate(3, {error, not_found}),
+    {Res, []} = rpc:multicall(Cluster, locker, dirty_read, [Key]),
 
     teardown([A, B, C]).
 
