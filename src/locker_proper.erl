@@ -5,8 +5,8 @@
 
 -record(state, {master_leases, replicated_leases}).
 
--define(MASTERS, ['a@knutin']).
--define(REPLICAS, ['b@knutin']).
+-define(MASTERS, [host_name("a")]).
+-define(REPLICAS, [host_name("b")]).
 
 test() ->
     proper:quickcheck(prop_lock_release()).
@@ -167,3 +167,7 @@ setup(NodeNames) ->
 
 teardown(Nodes) ->
     lists:map(fun slave:stop/1, Nodes).
+
+%% @doc Return fully qualified name for local host node.
+host_name(Name) ->
+    list_to_atom(Name ++ "@" ++ net_adm:localhost()).
