@@ -433,6 +433,11 @@ handle_call({wait_for, Key, Timeout}, From, #state{waiters = Waiters} = State) -
     %% gen_server:call/3. We will reply when replaying the transaction
     %% log. If we do not have a response within the given timeout, the
     %% reply is discarded.
+
+    %% Possible race: wait_for/2 reads from ETS, finds nothing, sends
+    %% this message. Before this message is processed, we have
+    %% processed the transaction log, the waiter will time out. Fix:
+    %% read again here?
     {noreply, State#state{waiters = [{Key, From, now_to_ms() + Timeout} | Waiters]}};
 
 handle_call({wait_for_release, Key, Timeout}, From,
