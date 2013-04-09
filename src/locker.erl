@@ -13,7 +13,8 @@
 -export([start_link/1, start_link/4]).
 -export([set_w/2, set_nodes/3]).
 
--export([lock/2, lock/3, extend_lease/3, release/2, wait_for/2]).
+-export([lock/2, lock/3, update/3, update/4, extend_lease/3, release/2,
+         wait_for/2]).
 -export([dirty_read/1, master_dirty_read/1]).
 -export([lag/0, summary/0]).
 
@@ -93,6 +94,31 @@ lock(Key, Value, LeaseLength, Timeout) ->
                                          LeaseLength, Timeout),
             {OkWrites, _} = ok_responses(WriteReplies),
             {ok, W, length(OkNodes), length(OkWrites)};
+        _ ->
+            {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
+            {error, no_quorum}
+    end.
+
+update(Key, Value, NewValue) ->
+    update(Key, Value, NewValue, 5000).
+
+%% @doc: Tries to update the lock. The update only happens if an existing
+%% value of the lock corresponds to the given Value within the W number of
+%% master nodes.
+%% Returns the same tuple as in lock/4 case.
+update(Key, Value, NewValue, Timeout) ->
+    Nodes = get_meta_ets(nodes),
+    W = get_meta_ets(w),
+
+    %% Try getting the write lock on all nodes
+    {Tag, RequestReplies, _BadNodes} = get_write_lock(Nodes, Key, Value,
+                                                      Timeout),
+
+    case ok_responses(RequestReplies) of
+        {OkNodes, _} when length(OkNodes) >= W ->
+            {UpdateReplies, _} = do_update(Nodes, Tag, Key, NewValue, Timeout),
+            {OkUpdates, _} = ok_responses(UpdateReplies),
+            {ok, W, length(OkNodes), length(OkUpdates)};
         _ ->
             {_AbortReplies, _} = release_write_lock(Nodes, Tag, Timeout),
             {error, no_quorum}
@@ -218,6 +244,10 @@ do_write(Nodes, Tag, Key, Value, LeaseLength, Timeout) ->
                           {write, Tag, Key, Value, LeaseLength},
                           Timeout).
 
+do_update(Nodes, Tag, Key, Value, Timeout) ->
+    gen_server:multi_call(Nodes, locker,
+                          {update, Tag, Key, Value},
+                          Timeout).
 
 release_write_lock(Nodes, Tag, Timeout) ->
     gen_server:multi_call(Nodes, locker, {release_write_lock, Tag}, Timeout).
@@ -327,6 +357,22 @@ handle_call({write, LockTag, Key, Value, LeaseLength}, _From,
     NewTransLog = [{write, Key, Value, LeaseLength} | TransLog],
     {reply, ok, State#state{trans_log = NewTransLog}};
 
+handle_call({update, LockTag, Key, Value}, _From,
+            #state{trans_log = TransLog} = State) ->
+    del_lock(LockTag),
+
+    case ets:lookup(?DB, Key) of
+        [{Key, _Value, ExpireAt}] ->
+            %% Update the lock
+            ets:insert(?DB, {Key, Value, ExpireAt});
+        [] ->
+            %% Lock not found (most likely it has expired after acquiring write
+            %% lock)
+            ok
+    end,
+
+    NewTransLog = [{update, Key, Value} | TransLog],
+    {reply, ok, State#state{trans_log = NewTransLog}};
 
 %%
 %% LEASES
@@ -462,7 +508,28 @@ handle_cast({trans_log, _FromNode, TransLog}, State0) ->
                   [] ->
                       ok
               end,
+                State;
+
+            ({update, Key, Value}, State) ->
+                delete_expire(expires(Key), Key),
+
+                case ets:lookup(?DB, Key) of
+                    [{Key, _Value, ExpireAt}] ->
+                        ets:insert(?DB, {Key, Value, ExpireAt}),
+                        %% If removal of expired locks and updates were handled
+                        %% by multiple processes, i.e. in non-sequential order,
+                        %% then it would be possible to end up in a situation,
+                        %% in which expired lock has been re-inserted. Calling
+                        %% scedule_expire/2 after updating the lock prevents
+                        %% from that.
+                        schedule_expire(ExpireAt, Key);
+                    [] ->
+                        %% Lock has been expired
+                        ok
+                end,
+
                 State
+
         end,
 
     NewState = lists:foldl(ReplayF, State0, TransLog),

@@ -5,8 +5,8 @@
 
 -record(state, {master_leases, replicated_leases}).
 
--define(MASTERS, ['a@knutin']).
--define(REPLICAS, ['b@knutin']).
+-define(MASTERS, [host_name("a")]).
+-define(REPLICAS, [host_name("b")]).
 
 test() ->
     proper:quickcheck(prop_lock_release()).
@@ -53,6 +53,8 @@ command(S) ->
               [{call, ?MODULE, read, [get_node(), key()]}] ++
               [?LET({Key, Value}, elements(S#state.master_leases),
                     {call, ?MODULE, release, [get_node(), Key, Value]}) || Leases] ++
+              [{call, ?MODULE, update, [get_node(), key(), value(), value()]}
+                || Leases] ++
               [{call, ?MODULE, replicate, []}]
          ).
 
@@ -62,6 +64,9 @@ lock(Node, Key, Value) ->
 
 release(Node, Key, Value) ->
     rpc:call(Node, locker, release, [Key, Value]).
+
+update(Node, Key, Value, NewValue) ->
+    rpc:call(Node, locker, update, [Key, Value, NewValue]).
 
 replicate() ->
     rpc:sbcast(?MASTERS, locker, push_trans_log).
@@ -98,6 +103,16 @@ next_state(S, _V, {call, _, release, [_, Key, Value]}) ->
             S
     end;
 
+next_state(S, _V, {call, _, update, [_, Key, Value, NewValue]}) ->
+    case lists:member({Key, Value}, S#state.master_leases) of
+        true ->
+            S#state{master_leases = [{Key, NewValue} |
+                                        lists:delete({Key, Value},
+                                                     S#state.master_leases)]};
+        false ->
+            S
+    end;
+
 next_state(S, _V, {call, _, replicate, []}) ->
     S#state{replicated_leases = S#state.master_leases};
 
@@ -120,6 +135,15 @@ postcondition(S, {call, _, release, [_, Key, Value]}, {ok, _, _, _}) ->
 
 postcondition(S, {call, _, release, [_, Key, _Value]}, {error, no_quorum}) ->
     lists:keymember(Key, 1, S#state.master_leases);
+
+postcondition(S, {call, _, update, [_, Key, Value, _NewValue]},
+              {ok, _, _, _}) ->
+    lists:member({Key, Value}, S#state.master_leases);
+
+postcondition(S, {call, _, update, [_, Key, Value, _NewValue]},
+              {error, no_quorum}) ->
+    Val = lists:keymember(Key, 1, S#state.master_leases),
+    Val orelse (Val =/= Value);
 
 postcondition(_S, {call, _, replicate, []}, _) ->
     true;
@@ -167,3 +191,7 @@ setup(NodeNames) ->
 
 teardown(Nodes) ->
     lists:map(fun slave:stop/1, Nodes).
+
+%% @doc Return fully qualified name for local host node.
+host_name(Name) ->
+    list_to_atom(Name ++ "@" ++ net_adm:localhost()).
