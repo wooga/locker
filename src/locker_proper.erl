@@ -25,7 +25,6 @@ prop_lock_release() ->
                       Result =:= ok)
                end)).
 
-
 key() ->
     elements([1]).
 
@@ -52,12 +51,12 @@ command(S) ->
     oneof([{call, ?MODULE, lock, [get_node(), key(), value()]}] ++
               [{call, ?MODULE, read, [get_node(), key()]}] ++
               [?LET({Key, Value}, elements(S#state.master_leases),
-                    {call, ?MODULE, release, [get_node(), Key, Value]}) || Leases] ++
+                    {call, ?MODULE, release,
+                     [get_node(), Key, Value]}) || Leases] ++
               [{call, ?MODULE, update, [get_node(), key(), value(), value()]}
                 || Leases] ++
               [{call, ?MODULE, replicate, []}]
          ).
-
 
 lock(Node, Key, Value) ->
     rpc:call(Node, locker, lock, [Key, Value]).
@@ -69,7 +68,8 @@ update(Node, Key, Value, NewValue) ->
     rpc:call(Node, locker, update, [Key, Value, NewValue]).
 
 replicate() ->
-    rpc:sbcast(?MASTERS, locker, push_trans_log).
+    rpc:sbcast(?MASTERS, locker, push_trans_log),
+    timer:sleep(200).
 
 read(Node, Key) ->
     rpc:call(Node, locker, dirty_read, [Key]).
@@ -84,7 +84,6 @@ precondition(S, {call, _, release, [_, Key, _Value]}) ->
 precondition(_, _) ->
     true.
 
-
 next_state(S, _V, {call, _, lock, [_, Key, Value]}) ->
     case lists:keymember(Key, 1, S#state.master_leases) of
         true ->
@@ -96,9 +95,10 @@ next_state(S, _V, {call, _, lock, [_, Key, Value]}) ->
 next_state(S, _V, {call, _, release, [_, Key, Value]}) ->
     case lists:member({Key, Value}, S#state.master_leases) of
         true ->
-            S#state{master_leases = lists:delete({Key, Value}, S#state.master_leases),
-                    replicated_leases = lists:delete({Key, Value},
-                                                     S#state.replicated_leases)};
+            S#state{master_leases = lists:delete({Key, Value},
+                                                 S#state.master_leases),
+                    replicated_leases =
+                        lists:delete({Key, Value}, S#state.replicated_leases)};
         false ->
             S
     end;
@@ -119,8 +119,6 @@ next_state(S, _V, {call, _, replicate, []}) ->
 next_state(S, _V, {call, _, read, _}) ->
     S.
 
-
-
 postcondition(S, {call, _, lock, [_, Key, _Value]}, Result) ->
     case Result of
         {ok, _, _, _} ->
@@ -128,7 +126,6 @@ postcondition(S, {call, _, lock, [_, Key, _Value]}, Result) ->
         {error, no_quorum} ->
             lists:keymember(Key, 1, S#state.master_leases)
     end;
-
 
 postcondition(S, {call, _, release, [_, Key, Value]}, {ok, _, _, _}) ->
     lists:member({Key, Value}, S#state.master_leases);
@@ -166,10 +163,6 @@ postcondition(S, {call, _, read, [Node, Key]}, Result) ->
             end
     end.
 
-
-
-
-
 %%
 %% SETUP
 %%
@@ -187,7 +180,6 @@ setup(Name) when is_atom(Name) ->
 
 setup(NodeNames) ->
     lists:map(fun setup/1, NodeNames).
-
 
 teardown(Nodes) ->
     lists:map(fun slave:stop/1, Nodes).

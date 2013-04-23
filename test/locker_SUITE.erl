@@ -20,6 +20,7 @@ all() ->
      replica,
      promote,
      wait_for,
+     wait_for_release,
      update
     ].
 
@@ -294,6 +295,29 @@ wait_for(_) ->
 
     rpc:sbcast([A, B, C], locker, push_trans_log),
     {ok, Pid} = rpc:call(C, locker, wait_for, [123, 5000]),
+
+    teardown([A, B, C]).
+
+wait_for_release(_) ->
+    [A, B, C] = Cluster = setup([a, b, c]),
+
+    LeaseLength = 500,
+    ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
+
+    Pid = self(),
+    {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid, LeaseLength, 1000]),
+
+    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
+    {error, key_not_locked} =
+        rpc:call(C, locker, wait_for_release, [123, 100]),
+
+    rpc:sbcast([A, B, C], locker, push_trans_log),
+    ExpireLeases = fun() ->
+                           timer:sleep(LeaseLength),
+                           rpc:sbcast([A, B, C], locker, expire_leases)
+                   end,
+    spawn(ExpireLeases),
+    {ok, released} = rpc:call(C, locker, wait_for_release, [123, 1000]),
 
     teardown([A, B, C]).
 
