@@ -15,7 +15,7 @@
 
 -export([lock/2, lock/3, lock/4, update/3, update/4,
          extend_lease/3,release/2, release/3]).
--export([wait_for/2, wait_for_release/2]).
+-export([wait_for/2, wait_for_release/1, wait_for_release/2]).
 -export([dirty_read/1, master_dirty_read/1]).
 -export([lag/0, summary/0]).
 
@@ -139,6 +139,9 @@ wait_for(Key, Timeout) ->
         {error, not_found} ->
             gen_server:call(locker, {wait_for, Key, Timeout}, Timeout)
     end.
+
+wait_for_release(Key) ->
+    wait_for_release(Key, 5000).
 
 wait_for_release(Key, Timeout) ->
     case dirty_read(Key) of

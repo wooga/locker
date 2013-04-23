@@ -68,8 +68,7 @@ update(Node, Key, Value, NewValue) ->
     rpc:call(Node, locker, update, [Key, Value, NewValue]).
 
 replicate() ->
-    rpc:sbcast(?MASTERS, locker, push_trans_log),
-    timer:sleep(200).
+    rpc:sbcast(?MASTERS, locker, push_trans_log).
 
 read(Node, Key) ->
     rpc:call(Node, locker, dirty_read, [Key]).
