@@ -16,12 +16,14 @@ It is designed to be used inside your application on the Erlang VM,
 using the Erlang distribution to communicate with masters and
 replicas.
 
-There are four operations:
+Operations:
 
- * `locker:lock/2,3`
+ * `locker:lock/2,3,4`
+ * `locker:update/3,4`
  * `locker:extend_lease/3`
- * `locker:release/2`
- * `locker:wait_for/1`
+ * `locker:release/2,3`
+ * `locker:wait_for/2`
+ * `locker:wait_for_release/2`
 
 
 ### Writes
@@ -44,7 +46,6 @@ promises it received.
 `locker` currently only offers dirty reads from the local node. If we
 need consistent reads, a read quorum can be used.
 
-
 ### Failure
 
 "So, this is all fine and good, but what happens when something
@@ -58,8 +59,8 @@ away from the rest of the cluster, the lock might expire too soon
 resulting in reads returning the empty value. However, a new lock
 cannot be created as a quorum cannot be reached.
 
-In the future, subscribers to a lock could be notified when it expires.
-
+Calling `locker:wait_for_release/2` will block until a lock expires,
+either by manual release or from a expired lease.
 
 ### Lease expiration
 
@@ -86,7 +87,6 @@ improve performance by reducing the number of messages each replica
 needs to handle. Calling `locker:wait_for/2` after a succesful write
 will block until the key is replicated to the local node. If the local
 node is a master, it will return immediately.
-
 
 ### Adding new nodes
 

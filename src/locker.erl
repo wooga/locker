@@ -13,8 +13,9 @@
 -export([start_link/1, start_link/4]).
 -export([set_w/2, set_nodes/3]).
 
--export([lock/2, lock/3, update/3, update/4, extend_lease/3, release/2,
-         wait_for/2]).
+-export([lock/2, lock/3, lock/4, update/3, update/4,
+         extend_lease/3,release/2, release/3]).
+-export([wait_for/2, wait_for_release/1, wait_for_release/2]).
 -export([dirty_read/1, master_dirty_read/1]).
 -export([lag/0, summary/0]).
 
@@ -34,8 +35,11 @@
           %% push_replica timer
           trans_log = [],
 
-          %% Clients can wait for a key to become available
+          %% Clients can wait for a key to become locked
           waiters = [],
+
+          %% Clients can wait for a lock to be released
+          release_waiters = [],
 
           %% Previous point of expiration, no keys older than this
           %% point should exist
@@ -136,6 +140,17 @@ wait_for(Key, Timeout) ->
             gen_server:call(locker, {wait_for, Key, Timeout}, Timeout)
     end.
 
+wait_for_release(Key) ->
+    wait_for_release(Key, 5000).
+
+wait_for_release(Key, Timeout) ->
+    case dirty_read(Key) of
+        {ok, _Value} ->
+            gen_server:call(locker, {wait_for_release, Key, Timeout}, Timeout);
+        {error, not_found} ->
+            {error, key_not_locked}
+    end.
+
 release(Key, Value) ->
     release(Key, Value, 5000).
 
@@ -227,8 +242,6 @@ summary() ->
 get_meta() ->
     {get_meta_ets(nodes), get_meta_ets(replicas), get_meta_ets(w)}.
 
-
-
 %%
 %% Helpers
 %%
@@ -259,8 +272,6 @@ get_meta_ets(Key) ->
         [{Key, Value}] ->
             Value
     end.
-
-
 
 %% @doc: Replaces the primary and replica node list on all nodes in
 %% the cluster. Assumes no failures.
@@ -303,7 +314,6 @@ init([W, LeaseExpireInterval, LockExpireInterval, PushTransInterval]) ->
                 push_trans_log_ref = PushTransLog,
                 prev_expire_point = now_to_seconds()}}.
 
-
 %%
 %% WRITE-LOCKS
 %%
@@ -337,7 +347,6 @@ handle_call({get_write_lock, Key, Value, Tag}, _From, State) ->
 handle_call({release_write_lock, Tag}, _From, State) ->
     del_lock(Tag),
     {reply, ok, State};
-
 
 %%
 %% DATABASE OPERATIONS
@@ -397,21 +406,23 @@ handle_call({extend_lease, LockTag, Key, Value, ExtendLength}, _From,
 
 handle_call({release, Key, Value, LockTag}, _From,
             #state{trans_log = TransLog} = State) ->
-    case ets:lookup(?DB, Key) of
-        [{Key, Value, ExpireAt}] ->
-            del_lock(LockTag),
-            ets:delete(?DB, Key),
-            delete_expire(ExpireAt, Key),
+    {Reply, NewState} =
+        case ets:lookup(?DB, Key) of
+            [{Key, Value, ExpireAt}] ->
+                del_lock(LockTag),
+                ets:delete(?DB, Key),
+                delete_expire(ExpireAt, Key),
 
-            NewTransLog = [{release, Key} | TransLog],
-            {reply, ok, State#state{trans_log = NewTransLog}};
+                NewTransLog = [{release, Key} | TransLog],
+                {ok, State#state{trans_log = NewTransLog}};
 
-        [{Key, _OtherValue, _}] ->
-            {reply, {error, not_owner}, State};
-        [] ->
-            {reply, {error, not_found}, State}
-    end;
-
+            [{Key, _OtherValue, _}] ->
+                {{error, not_owner}, State};
+            [] ->
+                {{error, not_found}, State}
+        end,
+    NewWaiters = notify_release_waiter(Key, released, NewState#state.release_waiters),
+    {reply, Reply, NewState#state{release_waiters = NewWaiters}};
 
 %%
 %% WAIT-FOR
@@ -424,6 +435,13 @@ handle_call({wait_for, Key, Timeout}, From, #state{waiters = Waiters} = State) -
     %% reply is discarded.
     {noreply, State#state{waiters = [{Key, From, now_to_ms() + Timeout} | Waiters]}};
 
+handle_call({wait_for_release, Key, Timeout}, From,
+            #state{release_waiters = Waiters} = State) ->
+    %% 'From' waits for the given key lock to become released, using
+    %% gen_server:call/3. We will reply when replaying the transaction
+    %% log. If we do not have a response within the given timeout, the
+    %% reply is discarded.
+    {noreply, State#state{release_waiters = [{Key, From, now_to_ms() + Timeout} | Waiters]}};
 
 %%
 %% ADMINISTRATION
@@ -447,7 +465,6 @@ handle_call(get_debug_state, _From, State) ->
              State#state.write_locks_expire_ref,
              State#state.push_trans_log_ref}, State}.
 
-
 %%
 %% REPLICATION
 %%
@@ -458,22 +475,7 @@ handle_cast({trans_log, _FromNode, TransLog}, State0) ->
     %% In the future, we might want to offset the lease length in the
     %% master before writing it to the log to ensure the lease length
     %% is at least reasonably similar for all replicas.
-
     Now = now_to_ms(),
-    NotifyFun =
-        fun (Key, Value, AllWaiters) ->
-                {Waiters, NewWaiters} =
-                    lists:partition(fun ({K, _, _}) when Key =:= K -> true;
-                                        (_)           -> false
-                                    end, AllWaiters),
-                lists:foreach(fun ({_, From, Expire}) when Expire > Now ->
-                                      gen_server:reply(From, {ok, Value});
-                                  (_) ->
-                                      ok
-                              end, Waiters),
-                NewWaiters
-        end,
-
     ReplayF =
         fun ({write, Key, Value, LeaseLength}, State) ->
                 %% With multiple masters, we will get multiple writes
@@ -486,7 +488,8 @@ handle_cast({trans_log, _FromNode, TransLog}, State0) ->
                 ets:insert(?DB, {Key, Value, ExpireAt}),
                 schedule_expire(ExpireAt, Key),
 
-                NewWaiters = NotifyFun(Key, Value, State#state.waiters),
+                NewWaiters = notify_lock_waiter(Now, Key, Value,
+                                                State#state.waiters),
                 State#state{waiters = NewWaiters};
 
             ({extend_lease, Key, Value, ExtendLength}, State) ->
@@ -543,7 +546,6 @@ handle_cast(Msg, State) ->
 %% SYSTEM EVENTS
 %%
 
-
 handle_info(expire_leases, State) ->
     %% Delete any leases that has expired. There might be writes in
     %% flight, but they have already been validated in the locking
@@ -552,11 +554,17 @@ handle_info(expire_leases, State) ->
     Now = now_to_seconds(),
     Expired = lists:flatmap(fun (T) -> ets:lookup(?EXPIRE_DB, T) end,
                             lists:seq(State#state.prev_expire_point, Now)),
-    lists:foreach(fun ({At, Key}) ->
-                          delete_expire(At, Key),
-                          ets:delete(?DB, Key)
-                  end, Expired),
-    {noreply, State#state{prev_expire_point = Now}};
+
+    ReleaseLockAndNotifyWaiters =
+        fun ({At, Key}, RemainingWaiters) ->
+                delete_expire(At, Key),
+                ets:delete(?DB, Key),
+                notify_release_waiter(Key, released, RemainingWaiters)
+        end,
+    NewWaiters = lists:foldl(ReleaseLockAndNotifyWaiters,
+                             State#state.release_waiters, Expired),
+    {noreply, State#state{prev_expire_point = Now,
+                          release_waiters = NewWaiters}};
 
 handle_info(expire_locks, State) ->
     %% Make a table scan of the write locks. There should be very few
@@ -588,6 +596,31 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+%% Notify waiter on a lock that the lock has been taken.
+notify_lock_waiter(Now, Key, Value, AllWaiters) ->
+    KeyWaiter = fun ({K, _, _}) when Key =:= K -> true;
+                    (_) -> false
+                end,
+    ReplyIfNotExpired =
+        fun ({_, From, Expire}) when Expire > Now ->
+                gen_server:reply(From, {ok, Value});
+            (_) ->
+                ok
+        end,
+    {KeyWaiters, OtherWaiters} = lists:partition(KeyWaiter, AllWaiters),
+    lists:foreach(ReplyIfNotExpired, KeyWaiters),
+    OtherWaiters.
+
+%% Notify waiter of a release of a lock, even if it is expired.
+notify_release_waiter(Key, Value, AllWaiters) ->
+    KeyWaiter = fun ({K, _, _}) when Key =:= K -> true;
+                    (_) -> false
+                end,
+    Reply = fun ({_, From, _Expire}) -> gen_server:reply(From, {ok, Value}) end,
+    {KeyWaiters, OtherWaiters} = lists:partition(KeyWaiter, AllWaiters),
+    lists:foreach(Reply, KeyWaiters),
+    OtherWaiters.
+
 now_to_seconds() ->
     now_to_seconds(os:timestamp()).
 
@@ -605,7 +638,6 @@ ok_responses(Replies) ->
     lists:partition(fun ({_, ok}) -> true;
                         (_)       -> false
                     end, Replies).
-
 
 %%
 %% EXPIRATION
@@ -629,7 +661,6 @@ expires(Key) ->
         [] ->
             []
     end.
-
 
 %%
 %% WRITE-LOCKS
