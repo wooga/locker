@@ -3,3 +3,5 @@ logs
 ebin
 deps
 *.beam
+*~
+.DS_Store

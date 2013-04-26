@@ -157,10 +157,10 @@ extend_propagates(_) ->
     ok = rpc:call(A, locker, extend_lease, [123, Pid, 2000]),
 
 
-    {ok, [], [{123, Pid, ExA}], _, _, _} = state(A),
-    {ok, [], [{123, Pid, ExB}], _, _, _} = state(B),
+    {ok, [], [{123, Pid, _ExA}], _, _, _} = state(A),
+    {ok, [], [{123, Pid, _ExB}], _, _, _} = state(B),
     rpc:sbcast([A, B, C], locker, push_trans_log),
-    {ok, [], [{123, Pid, ExC}], _, _, _} = state(C),
+    {ok, [], [{123, Pid, _ExC}], _, _, _} = state(C),
 
     %% abs((ExA - ExB)) < 3 orelse throw(too_much_drift),
     %% abs((ExB - ExC)) < 3 orelse throw(too_much_drift),
@@ -300,24 +300,31 @@ wait_for(_) ->
 
 wait_for_release(_) ->
     [A, B, C] = Cluster = setup([a, b, c]),
-
-    LeaseLength = 500,
     ok = rpc:call(A, locker, set_nodes, [Cluster, [A, B], [C]]),
 
-    Pid = self(),
+    LeaseLength = 500,
+    Pid = Parent = self(),
     {ok, 2, 2, 2} = rpc:call(A, locker, lock, [123, Pid, LeaseLength, 1000]),
 
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
     {error, key_not_locked} =
         rpc:call(C, locker, wait_for_release, [123, 100]),
 
     rpc:sbcast([A, B, C], locker, push_trans_log),
-    ExpireLeases = fun() ->
-                           timer:sleep(LeaseLength),
-                           rpc:sbcast([A, B, C], locker, expire_leases)
-                   end,
-    spawn(ExpireLeases),
-    {ok, released} = rpc:call(C, locker, wait_for_release, [123, 1000]),
+    timer:sleep(100),
+
+    P1 = spawn(fun() ->
+                       Parent ! {self(), (catch rpc:call(B, locker, wait_for_release, [123, 1000]))}
+               end),
+    P2 = spawn(fun() ->
+                       Parent ! {self(), (catch rpc:call(C, locker, wait_for_release, [123, 1000]))}
+               end),
+    timer:sleep(LeaseLength),
+    rpc:sbcast([A, B, C], locker, expire_leases),
+
+    {ok, released} = receive {P1, M1} -> M1 end,
+    {ok, released} = receive {P2, M2} -> M2 end,
 
     teardown([A, B, C]).
 
