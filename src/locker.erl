@@ -217,7 +217,8 @@ dirty_read(Key) ->
 %% @doc: Execute a dirty read on the master. Same caveats as for
 %% dirty_read/1
 master_dirty_read(Key) ->
-    [Master | _Masters] = get_meta_ets(nodes),
+    Masters = get_meta_ets(nodes),
+    Master = lists:nth(random:uniform(length(Masters)), Masters),
     rpc:call(Master, locker, dirty_read, [Key]).
 
 %%
