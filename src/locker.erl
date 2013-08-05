@@ -234,11 +234,8 @@ lag() ->
     {Time / 1000, Result}.
 
 summary() ->
-    {ok, WriteLocks, Leases,
-     _LeaseExpireRef, _WriteLocksExpireRef, _PushTranslogRef} =
-        get_debug_state(),
-    [{write_locks, length(WriteLocks)},
-     {leases, length(Leases)}].
+    [{write_locks, ets:info(?LOCK_DB, size)},
+     {leases, ets:info(?DB, size)}].
 
 get_meta() ->
     {get_meta_ets(nodes), get_meta_ets(replicas), get_meta_ets(w)}.
