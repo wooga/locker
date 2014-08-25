@@ -218,8 +218,13 @@ dirty_read(Key) ->
 %% dirty_read/1
 master_dirty_read(Key) ->
     Masters = get_meta_ets(nodes),
-    Master = lists:nth(random:uniform(length(Masters)), Masters),
-    rpc:call(Master, locker, dirty_read, [Key]).
+    case lists:member(node(), Masters) of
+        true ->
+            dirty_read(Key);
+        false ->
+            Master = lists:nth(random:uniform(length(Masters)), Masters),
+            rpc:call(Master, locker, dirty_read, [Key])
+    end.
 
 %%
 %% Helpers for operators
