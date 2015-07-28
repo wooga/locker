@@ -29,11 +29,10 @@ run(Start, End, ExtendInterval, LeaseLength) ->
 
 
 session(Id, ExtendInterval, LeaseLength) ->
-    Start = now(),
+    Start = erlang:monotonic_time(micro_seconds),
     case locker:lock(Id, self(), LeaseLength) of
         {ok, _, _, _} ->
-            statman_histogram:record_value(get_lease,
-                                           timer:now_diff(now(), Start)),
+            statman_histogram:record_value(get_lease, (erlang:monotonic_time(micro_seconds) - Start)),
             ?MODULE:session_loop(Id, ExtendInterval, LeaseLength);
         {error, _} ->
             error_logger:info_msg("~p: could not get lock~n", [Id])
@@ -44,11 +43,10 @@ session_loop(Id, ExtendInterval, LeaseLength) ->
 
     receive
         extend ->
-            Start = now(),
+            Start = erlang:monotonic_time(micro_seconds),
             case locker:extend_lease(Id, self(), LeaseLength) of
                 ok ->
-                    statman_histogram:record_value(extend_lease,
-                                                   timer:now_diff(now(), Start)),
+                    statman_histogram:record_value(extend_lease, (erlang:monotonic_time(micro_seconds) - Start)),
                     ?MODULE:session_loop(Id, ExtendInterval, LeaseLength);
                 {error, _} ->
                     error_logger:info_msg("~p: could not extend lease~n", [Id])
