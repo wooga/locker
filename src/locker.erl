@@ -566,8 +566,17 @@ handle_info(expire_leases, State) ->
     ReleaseLockAndNotifyWaiters =
         fun ({At, Key}, RemainingWaiters) ->
                 delete_expire(At, Key),
-                ets:delete(?DB, Key),
-                notify_release_waiter(Key, released, RemainingWaiters)
+                case ets:lookup(?DB, Key) of
+                    [{Key, _Value, ExpAt}] when ExpAt =:= At ->
+                        ets:delete(?DB, Key),
+                        notify_release_waiter(Key, released, RemainingWaiters);
+                    _Other ->
+                        %% locker_expire_db is out of sync with locker_db
+                        %% resulting in one correct and one or more incorrect
+                        %% locker_exipre_db entries.
+                        %% This exipre entry is incorrect.
+                        RemainingWaiters
+                end
         end,
     NewWaiters = lists:foldl(ReleaseLockAndNotifyWaiters,
                              State#state.release_waiters, Expired),
