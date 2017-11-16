@@ -638,6 +638,13 @@ notify_release_waiter(Key, Value, AllWaiters) ->
     lists:foreach(Reply, KeyWaiters),
     OtherWaiters.
 
+-ifdef(support_new_time_api).
+now_to_seconds() ->
+    erlang:monotonic_time(second).
+
+now_to_ms() ->
+    erlang:monotonic_time(millisecond).
+-else.
 now_to_seconds() ->
     now_to_seconds(os:timestamp()).
 
@@ -650,6 +657,7 @@ now_to_ms() ->
 
 now_to_ms({MegaSecs,Secs,MicroSecs}) ->
     (MegaSecs * 1000000 + Secs) * 1000 + MicroSecs div 1000.
+-endif.
 
 ok_responses(Replies) ->
     lists:partition(fun ({_, ok}) -> true;
