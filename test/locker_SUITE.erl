@@ -67,32 +67,6 @@ quorum(_) ->
 
     teardown([A, B, C]).
 
-no_quorum_possible(_) ->
-    [A, B, C] = setup([a, b, c]),
-    ok = rpc:call(A, locker, set_nodes, [[A, B], [A, B], []]),
-
-    Parent = self(),
-    spawn(fun() ->
-                  Parent ! {1, catch rpc:call(A, locker, lock, [123, Parent])}
-          end),
-    spawn(fun() ->
-                  Parent ! {2, catch rpc:call(B, locker, lock, [123, Parent])}
-          end),
-
-    {error, no_quorum} = receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
-    {error, no_quorum} = receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
-
-    {error, not_found} = rpc:call(A, locker, dirty_read, [123]),
-    {error, not_found} = rpc:call(B, locker, dirty_read, [123]),
-    rpc:sbcast([A, B, C], locker, push_trans_log),
-    {error, not_found} = rpc:call(C, locker, dirty_read, [123]),
-
-    {ok, [], [], _, _, _} = state(A),
-    {ok, [], [], _, _, _} = state(B),
-    {ok, [], [], _, _, _} = state(C),
-
-    teardown([A, B, C]).
-
 release(_) ->
     [A, B, C] = Cluster = setup([a, b, c]),
     ok = rpc:call(A, locker, set_nodes, [Cluster, Cluster, []]),
