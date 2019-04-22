@@ -1,16 +1,12 @@
 -module(locker_SUITE).
 -compile([export_all]).
--include_lib("test_server/include/test_server.hrl").
 
--define (EBIN_DIR, lists:flatten(
-    filename:dirname(filename:dirname(filename:absname(""))) ++
-    ["/ebin"])).
+-define (EBIN_DIR, code:lib_dir(locker, ebin)).
 
 all() ->
     [
      api,
      quorum,
-     no_quorum_possible,
      release,
      lease_extend,
      expire_leases,
@@ -60,10 +56,10 @@ quorum(_) ->
     receive {1, P1} -> P1 after 1000 -> throw(timeout) end,
     receive {2, P2} -> P2 after 1000 -> throw(timeout) end,
 
-    ?line {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
-    ?line {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(A, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(B, locker, dirty_read, [123]),
     rpc:sbcast([A, B, C], locker, push_trans_log),
-    ?line {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
+    {ok, Pid} = rpc:call(C, locker, dirty_read, [123]),
 
     {ok, [], [{123, Pid, _}], _, _, _} = state(A),
     {ok, [], [{123, Pid, _}], _, _, _} = state(B),

@@ -222,7 +222,7 @@ master_dirty_read(Key) ->
         true ->
             dirty_read(Key);
         false ->
-            Master = lists:nth(random:uniform(length(Masters)), Masters),
+            Master = lists:nth(rand:uniform(length(Masters)), Masters),
             rpc:call(Master, locker, dirty_read, [Key])
     end.
 

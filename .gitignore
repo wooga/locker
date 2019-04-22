@@ -6,4 +6,4 @@ deps
 *~
 .DS_Store
 .rebar
-
+_build/
